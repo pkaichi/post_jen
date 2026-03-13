@@ -12,8 +12,9 @@ anyhow = "1.0.97"
 axum = "0.7.9"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+serde_yaml = "0.9.34"
 sqlx = { version = "0.8.4", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros"] }
-tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.44.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.17", features = ["time"] }
 tower-http = { version = "0.6.2", features = ["trace"] }
 tracing = "0.1.41"

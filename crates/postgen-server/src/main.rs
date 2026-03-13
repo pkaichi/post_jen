@@ -1,6 +1,8 @@
 mod config;
 mod db;
+mod definition;
 mod http;
+mod runner;
 
 use anyhow::Result;
 use axum::serve;
@@ -16,6 +18,7 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
+    runner::spawn(pool.clone());
     let state = AppState { pool };
     let app = router(state);
 
