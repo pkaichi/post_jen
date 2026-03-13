@@ -2,11 +2,15 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, SqlitePool};
+use std::{convert::Infallible, path::Path as FsPath, time::Duration};
+use tokio::time::interval;
+use tokio_stream::{StreamExt, wrappers::IntervalStream};
 use tower_http::trace::TraceLayer;
 
 #[derive(Clone)]
@@ -99,11 +103,96 @@ struct StartRunRequest {
     triggered_by: Option<String>,
 }
 
+#[derive(Debug, Serialize, FromRow)]
+struct StartRunResponse {
+    run_id: i64,
+    status: String,
+    queued_at: String,
+}
+
 async fn start_run(
-    Path(_job_id): Path<String>,
-    Json(_payload): Json<StartRunRequest>,
-) -> Result<StatusCode, ApiError> {
-    Err(ApiError::not_implemented("start_run is not implemented yet"))
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(payload): Json<StartRunRequest>,
+) -> Result<(StatusCode, Json<StartRunResponse>), ApiError> {
+    let job = sqlx::query_as::<_, JobDefinitionForRun>(
+        r#"
+        SELECT id, job_id, name, definition_path, definition_hash, enabled
+        FROM job_definitions
+        WHERE job_id = ?
+        "#,
+    )
+    .bind(&job_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let job = match job {
+        Some(job) => job,
+        None => return Err(ApiError::not_found("job not found")),
+    };
+
+    if job.enabled == 0 {
+        return Err(ApiError::conflict("job is disabled"));
+    }
+
+    let trigger_type = payload
+        .trigger_type
+        .unwrap_or_else(|| "manual".to_string())
+        .trim()
+        .to_string();
+    if trigger_type.is_empty() {
+        return Err(ApiError::bad_request("trigger_type must not be empty"));
+    }
+
+    let working_dir = derive_working_dir(&job.definition_path);
+    let mut tx = state.pool.begin().await?;
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO job_runs (
+            job_definition_id, job_id, job_name, status, trigger_type, triggered_by,
+            definition_path, definition_hash, working_dir, queued_at
+        )
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(job.id)
+    .bind(&job.job_id)
+    .bind(&job.name)
+    .bind(&trigger_type)
+    .bind(payload.triggered_by.as_deref())
+    .bind(&job.definition_path)
+    .bind(&job.definition_hash)
+    .bind(&working_dir)
+    .execute(&mut *tx)
+    .await?;
+
+    let run_id = result.last_insert_rowid();
+
+    sqlx::query(
+        r#"
+        INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at)
+        VALUES (?, NULL, 'job', 'status_changed', NULL, 'queued', 'run created', CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let response = sqlx::query_as::<_, StartRunResponse>(
+        r#"
+        SELECT id AS run_id, status, queued_at
+        FROM job_runs
+        WHERE id = ?
+        "#,
+    )
+    .bind(run_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,12 +286,159 @@ async fn get_run(
     }
 }
 
-async fn cancel_run(Path(_run_id): Path<i64>) -> Result<StatusCode, ApiError> {
-    Err(ApiError::not_implemented("cancel_run is not implemented yet"))
+#[derive(Debug, Serialize, FromRow)]
+struct CancelRunResponse {
+    run_id: i64,
+    status: String,
+    cancel_requested_at: Option<String>,
 }
 
-async fn rerun_run(Path(_run_id): Path<i64>) -> Result<StatusCode, ApiError> {
-    Err(ApiError::not_implemented("rerun_run is not implemented yet"))
+async fn cancel_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<Json<CancelRunResponse>, ApiError> {
+    let run = sqlx::query_as::<_, RunCancellationRecord>(
+        r#"
+        SELECT id, status, cancel_requested_at
+        FROM job_runs
+        WHERE id = ?
+        "#,
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let run = match run {
+        Some(run) => run,
+        None => return Err(ApiError::not_found("run not found")),
+    };
+
+    match run.status.as_str() {
+        "queued" | "running" => {
+            let mut tx = state.pool.begin().await?;
+
+            sqlx::query(
+                r#"
+                UPDATE job_runs
+                SET status = 'cancel_requested',
+                    cancel_requested_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                "#,
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at)
+                VALUES (?, NULL, 'job', 'status_changed', ?, 'cancel_requested', 'cancel requested', CURRENT_TIMESTAMP)
+                "#,
+            )
+            .bind(run_id)
+            .bind(&run.status)
+            .execute(&mut *tx)
+            .await?;
+
+            let response = sqlx::query_as::<_, CancelRunResponse>(
+                r#"
+                SELECT id AS run_id, status, cancel_requested_at
+                FROM job_runs
+                WHERE id = ?
+                "#,
+            )
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+
+            Ok(Json(response))
+        }
+        "cancel_requested" | "canceled" => Ok(Json(CancelRunResponse {
+            run_id: run.id,
+            status: run.status,
+            cancel_requested_at: run.cancel_requested_at,
+        })),
+        _ => Err(ApiError::conflict("run cannot be canceled in its current status")),
+    }
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct RerunRunResponse {
+    run_id: i64,
+    rerun_of_run_id: i64,
+    status: String,
+    queued_at: String,
+}
+
+async fn rerun_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<(StatusCode, Json<RerunRunResponse>), ApiError> {
+    let source_run = sqlx::query_as::<_, RunForRerun>(
+        r#"
+        SELECT id, job_definition_id, job_id, job_name, definition_path, definition_hash, working_dir
+        FROM job_runs
+        WHERE id = ?
+        "#,
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let source_run = match source_run {
+        Some(run) => run,
+        None => return Err(ApiError::not_found("run not found")),
+    };
+
+    let mut tx = state.pool.begin().await?;
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO job_runs (
+            job_definition_id, job_id, job_name, status, trigger_type, triggered_by,
+            definition_path, definition_hash, working_dir, queued_at, rerun_of_job_run_id
+        )
+        VALUES (?, ?, ?, 'queued', 'rerun', NULL, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+        "#,
+    )
+    .bind(source_run.job_definition_id)
+    .bind(&source_run.job_id)
+    .bind(&source_run.job_name)
+    .bind(&source_run.definition_path)
+    .bind(&source_run.definition_hash)
+    .bind(&source_run.working_dir)
+    .bind(source_run.id)
+    .execute(&mut *tx)
+    .await?;
+
+    let new_run_id = result.last_insert_rowid();
+
+    sqlx::query(
+        r#"
+        INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at)
+        VALUES (?, NULL, 'job', 'status_changed', NULL, 'queued', 'rerun created', CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(new_run_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let response = sqlx::query_as::<_, RerunRunResponse>(
+        r#"
+        SELECT id AS run_id, rerun_of_job_run_id AS rerun_of_run_id, status, queued_at
+        FROM job_runs
+        WHERE id = ?
+        "#,
+    )
+    .bind(new_run_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,8 +518,91 @@ async fn get_run_events(
     Ok(Json(events))
 }
 
-async fn stream_run(Path(_run_id): Path<i64>) -> Result<StatusCode, ApiError> {
-    Err(ApiError::not_implemented("stream_run is not implemented yet"))
+#[derive(Debug, Serialize, FromRow)]
+struct RunStreamSnapshot {
+    id: i64,
+    status: String,
+    queued_at: Option<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    cancel_requested_at: Option<String>,
+}
+
+async fn stream_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM job_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await?;
+
+    if exists == 0 {
+        return Err(ApiError::not_found("run not found"));
+    }
+
+    let pool = state.pool.clone();
+    let stream = IntervalStream::new(interval(Duration::from_secs(1))).then(move |_| {
+        let pool = pool.clone();
+        async move {
+            let snapshot = sqlx::query_as::<_, RunStreamSnapshot>(
+                r#"
+                SELECT id, status, queued_at, started_at, finished_at, cancel_requested_at
+                FROM job_runs
+                WHERE id = ?
+                "#,
+            )
+            .bind(run_id)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+
+            let (event, data) = match snapshot {
+                Some(snapshot) => (
+                    "run_state",
+                    serde_json::to_string(&snapshot)
+                        .unwrap_or_else(|_| "{\"error\":\"failed to serialize snapshot\"}".to_string()),
+                ),
+                None => (
+                    "run_deleted",
+                    json!({ "run_id": run_id, "status": "deleted" }).to_string(),
+                ),
+            };
+
+            Ok(Event::default().event(event).data(data))
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Debug, FromRow)]
+struct JobDefinitionForRun {
+    id: i64,
+    job_id: String,
+    name: String,
+    definition_path: String,
+    definition_hash: String,
+    enabled: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct RunCancellationRecord {
+    id: i64,
+    status: String,
+    cancel_requested_at: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct RunForRerun {
+    id: i64,
+    job_definition_id: i64,
+    job_id: String,
+    job_name: String,
+    definition_path: String,
+    definition_hash: String,
+    working_dir: String,
 }
 
 struct ApiError {
@@ -292,6 +611,20 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -299,12 +632,6 @@ impl ApiError {
         }
     }
 
-    fn not_implemented(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            message: message.into(),
-        }
-    }
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -321,4 +648,12 @@ impl axum::response::IntoResponse for ApiError {
         let body = Json(json!({ "error": self.message }));
         (self.status, body).into_response()
     }
+}
+
+fn derive_working_dir(definition_path: &str) -> String {
+    FsPath::new(definition_path)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string())
 }
