@@ -88,12 +88,11 @@ curl http://127.0.0.1:3000/api/runs/1/events
 
 ## 現時点の制限
 
-現状の雛形では、以下の API は stub のみで `501 Not Implemented` を返す。
-
-- `POST /api/jobs/:job_id/runs`
-- `POST /api/runs/:run_id/cancel`
-- `POST /api/runs/:run_id/rerun`
-- `GET /api/runs/:run_id/stream`
+- `POST /api/jobs/:job_id/runs` は実行レコード作成とキュー投入状態の記録までを行う
+- `POST /api/runs/:run_id/cancel` はキャンセル要求状態への更新までを行う
+- `POST /api/runs/:run_id/rerun` は再実行レコード作成までを行う
+- `GET /api/runs/:run_id/stream` は現在の状態スナップショットを SSE で返す
+- 実際のジョブ実行、ノード進行、ログ追記はまだ未実装
 
 ## 補足
 
