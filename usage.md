@@ -56,6 +56,29 @@ curl http://127.0.0.1:3000/api/health
 curl http://127.0.0.1:3000/api/jobs
 ```
 
+### ジョブ定義登録
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"definition_path":"/path/to/job.yaml","enabled":true}'
+```
+
+期待例:
+
+```json
+{
+  "job_id":"rust-sample-build",
+  "name":"Rust Sample Build",
+  "description":"Build and test a Rust project",
+  "definition_path":"/path/to/job.yaml",
+  "definition_hash":"...",
+  "enabled":1,
+  "created_at":"2026-03-14 12:00:00",
+  "updated_at":"2026-03-14 12:00:00"
+}
+```
+
 ### ジョブ詳細取得
 
 ```bash
@@ -92,7 +115,7 @@ curl http://127.0.0.1:3000/api/runs/1/events
 - `POST /api/runs/:run_id/cancel` はキャンセル要求状態への更新までを行う
 - `POST /api/runs/:run_id/rerun` は再実行レコード作成までを行う
 - `GET /api/runs/:run_id/stream` は現在の状態スナップショットを SSE で返す
-- 実際のジョブ実行、ノード進行、ログ追記はまだ未実装
+- 実行エンジンは順次実行の MVP 実装であり、並列実行や高度な再試行制御は未対応
 
 ## 補足
 

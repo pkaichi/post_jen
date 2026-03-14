@@ -5,10 +5,12 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
+use crate::definition::JobDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
-use std::{convert::Infallible, path::Path as FsPath, time::Duration};
+use std::{convert::Infallible, fs, path::Path as FsPath, time::Duration};
 use tokio::time::interval;
 use tokio_stream::{StreamExt, wrappers::IntervalStream};
 use tower_http::trace::TraceLayer;
@@ -21,7 +23,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs", get(list_jobs).post(register_job))
         .route("/api/jobs/:job_id", get(get_job))
         .route("/api/jobs/:job_id/runs", post(start_run))
         .route("/api/runs", get(list_runs))
@@ -62,6 +64,91 @@ async fn list_jobs(State(state): State<AppState>) -> Result<Json<Vec<JobSummary>
     .await?;
 
     Ok(Json(jobs))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterJobRequest {
+    definition_path: String,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct RegisterJobResponse {
+    job_id: String,
+    name: String,
+    description: Option<String>,
+    definition_path: String,
+    definition_hash: String,
+    enabled: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+async fn register_job(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterJobRequest>,
+) -> Result<(StatusCode, Json<RegisterJobResponse>), ApiError> {
+    let definition_path = payload.definition_path.trim();
+    if definition_path.is_empty() {
+        return Err(ApiError::bad_request("definition_path must not be empty"));
+    }
+
+    let definition = JobDefinition::load(definition_path)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let definition_contents = fs::read(definition_path)
+        .map_err(|error| ApiError::bad_request(format!("failed to read definition file: {error}")))?;
+    let definition_hash = format!("{:x}", Sha256::digest(definition_contents));
+    let enabled = if payload.enabled.unwrap_or(true) { 1_i64 } else { 0_i64 };
+
+    let existing = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM job_definitions WHERE job_id = ?")
+        .bind(&definition.id)
+        .fetch_one(&state.pool)
+        .await?;
+    let status = if existing == 0 {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_definitions (
+            job_id, name, description, definition_path, definition_hash, enabled
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(job_id) DO UPDATE SET
+            name = excluded.name,
+            description = excluded.description,
+            definition_path = excluded.definition_path,
+            definition_hash = excluded.definition_hash,
+            enabled = excluded.enabled,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(&definition.id)
+    .bind(&definition.name)
+    .bind(definition.description.as_deref())
+    .bind(definition_path)
+    .bind(&definition_hash)
+    .bind(enabled)
+    .execute(&mut *tx)
+    .await?;
+
+    let response = sqlx::query_as::<_, RegisterJobResponse>(
+        r#"
+        SELECT job_id, name, description, definition_path, definition_hash, enabled, created_at, updated_at
+        FROM job_definitions
+        WHERE job_id = ?
+        "#,
+    )
+    .bind(&definition.id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok((status, Json(response)))
 }
 
 #[derive(Debug, Serialize, FromRow)]
