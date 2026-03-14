@@ -32,6 +32,7 @@ curl http://127.0.0.1:3000/api/health
 
 - DB は既定で `sqlite:postgen.db` を使用する
 - 起動時に `db/schema.sql` を元に SQLite スキーマを自動初期化する
+- `POST /api/jobs` でジョブ定義 YAML を DB に登録できる
 - 環境変数などの詳細は `usage.md` を参照する
 
 ## 構成

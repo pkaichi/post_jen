@@ -47,6 +47,8 @@ pub struct NodeOutput {
 #[derive(Debug, Clone)]
 pub struct ResolvedJobDefinition {
     pub id: String,
+    pub name: String,
+    pub description: Option<String>,
     pub nodes: Vec<ResolvedNodeDefinition>,
 }
 
@@ -137,6 +139,8 @@ impl JobDefinition {
 
         Ok(ResolvedJobDefinition {
             id: self.id,
+            name: self.name,
+            description: self._description,
             nodes: resolved_nodes,
         })
     }
