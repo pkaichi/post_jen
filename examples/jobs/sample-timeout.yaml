@@ -1,0 +1,18 @@
+version: 1
+id: sample-timeout
+name: Sample Timeout Job
+description: Demonstrate node timeout handling
+defaults:
+  working_dir: /mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples
+  timeout_sec: 2
+  retry: 0
+nodes:
+  - id: sleep_too_long
+    name: Sleep past timeout
+    program: bash
+    args:
+      - -lc
+      - |
+        printf 'sleeping\n'
+        sleep 5
+        printf 'woke up\n'
