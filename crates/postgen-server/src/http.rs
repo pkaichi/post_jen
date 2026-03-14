@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
-use std::{convert::Infallible, fs, path::Path as FsPath, time::Duration};
+use std::{convert::Infallible, fs, time::Duration};
 use tokio::time::interval;
 use tokio_stream::{StreamExt, wrappers::IntervalStream};
 use tower_http::trace::TraceLayer;
@@ -231,7 +231,9 @@ async fn start_run(
         return Err(ApiError::bad_request("trigger_type must not be empty"));
     }
 
-    let working_dir = derive_working_dir(&job.definition_path);
+    let definition = JobDefinition::load(&job.definition_path)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let working_dir = definition.working_dir;
     let mut tx = state.pool.begin().await?;
 
     let result = sqlx::query(
@@ -735,12 +737,4 @@ impl axum::response::IntoResponse for ApiError {
         let body = Json(json!({ "error": self.message }));
         (self.status, body).into_response()
     }
-}
-
-fn derive_working_dir(definition_path: &str) -> String {
-    FsPath::new(definition_path)
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".to_string())
 }
