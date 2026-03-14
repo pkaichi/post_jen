@@ -49,6 +49,7 @@ pub struct ResolvedJobDefinition {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub working_dir: String,
     pub nodes: Vec<ResolvedNodeDefinition>,
 }
 
@@ -137,10 +138,18 @@ impl JobDefinition {
             });
         }
 
+        let working_dir = default_working_dir.unwrap_or_else(|| {
+            resolved_nodes
+                .first()
+                .map(|node| node.working_dir.clone())
+                .unwrap_or_else(|| ".".to_string())
+        });
+
         Ok(ResolvedJobDefinition {
             id: self.id,
             name: self.name,
             description: self._description,
+            working_dir,
             nodes: resolved_nodes,
         })
     }
