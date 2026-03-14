@@ -1,0 +1,27 @@
+version: 1
+id: sample-failure
+name: Sample Failure Job
+description: Demonstrate failed execution and skipped dependent node
+defaults:
+  working_dir: /mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples
+  timeout_sec: 30
+  retry: 0
+nodes:
+  - id: fail_step
+    name: Fail intentionally
+    program: bash
+    args:
+      - -lc
+      - |
+        printf 'about to fail\n'
+        exit 1
+
+  - id: skipped_after_failure
+    name: Should be skipped
+    program: bash
+    args:
+      - -lc
+      - |
+        printf 'this should not run\n'
+    depends_on:
+      - fail_step

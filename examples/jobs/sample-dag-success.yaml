@@ -1,0 +1,32 @@
+version: 1
+id: sample-dag-success
+name: Sample DAG Success Job
+description: Run two dependent nodes and produce a final artifact
+defaults:
+  working_dir: /mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples
+  timeout_sec: 30
+  retry: 0
+nodes:
+  - id: prepare
+    name: Prepare artifact directory
+    program: bash
+    args:
+      - -lc
+      - |
+        mkdir -p sample-dag-success
+        printf 'prepared\n' > sample-dag-success/prepare.log
+        printf 'prepare done\n'
+
+  - id: finalize
+    name: Write final artifact
+    program: bash
+    args:
+      - -lc
+      - |
+        printf 'final artifact\n' > sample-dag-success/final.txt
+        printf 'finalize done\n'
+    depends_on:
+      - prepare
+    outputs:
+      - path: sample-dag-success/final.txt
+        required: true
