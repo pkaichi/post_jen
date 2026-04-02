@@ -4,22 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## プロジェクト概要
 
-**postgen** — Rust製のジョブ実行サービス（Jenkins代替MVP）。YAML定義のジョブをDAG依存関係に基づいて逐次実行し、REST APIでジョブ管理・実行・監視を行う。
+**postjen** — Rust製のジョブ実行サービス（Jenkins代替MVP）。YAML定義のジョブをDAG依存関係に基づいて逐次実行し、REST APIでジョブ管理・実行・監視を行う。
 
 ## ビルド・実行コマンド
 
 ```bash
 # ビルド
-cargo build -p postgen-server
+cargo build -p postjen-server
 
-# 実行（デフォルト: 127.0.0.1:3000, sqlite:postgen.db）
-cargo run -p postgen-server
+# 実行（デフォルト: 127.0.0.1:3000, sqlite:postjen.db）
+cargo run -p postjen-server
 
 # ヘルスチェック
 curl http://127.0.0.1:3000/api/health
 
 # ログレベル変更
-RUST_LOG=debug cargo run -p postgen-server
+RUST_LOG=debug cargo run -p postjen-server
 ```
 
 自動テストは未整備。手動テストは `usage.md` の curl 例と `examples/jobs/` のサンプルYAMLで実施する。
@@ -29,14 +29,14 @@ RUST_LOG=debug cargo run -p postgen-server
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `POSTGEN_BIND_ADDR` | `127.0.0.1:3000` | リッスンアドレス |
-| `POSTGEN_DATABASE_URL` | `sqlite:postgen.db` | SQLiteパス |
+| `POSTGEN_DATABASE_URL` | `sqlite:postjen.db` | SQLiteパス |
 | `RUST_LOG` | `info` | ログレベル |
 
 ## アーキテクチャ
 
-Cargoワークスペース構成。メンバーは `crates/postgen-server` のみ。
+Cargoワークスペース構成。メンバーは `crates/postjen-server` のみ。
 
-### ソースモジュール (`crates/postgen-server/src/`)
+### ソースモジュール (`crates/postjen-server/src/`)
 
 - **main.rs** — エントリポイント。tracing初期化 → Config読込 → DB接続 → バックグラウンドワーカー起動 → Axumサーバ起動
 - **config.rs** — 環境変数からの設定読込

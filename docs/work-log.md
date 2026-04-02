@@ -2,14 +2,14 @@
 
 ## 概要
 
-このファイルは、`postgen` の実装作業でここまでに行った内容を時系列で残すためのログである。
-設計の詳細は [implementation-policy.md](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/docs/implementation-policy.md) を参照する。
+このファイルは、`postjen` の実装作業でここまでに行った内容を時系列で残すためのログである。
+設計の詳細は [implementation-policy.md](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/docs/implementation-policy.md) を参照する。
 
 ## 実施ログ
 
 ### 1. 初期セットアップ
 
-- Rust workspace と `postgen-server` の雛形を作成
+- Rust workspace と `postjen-server` の雛形を作成
 - `axum` ベースの HTTP サーバを追加
 - SQLite 初期化と `db/schema.sql` の読込を追加
 - `README.md` と `usage.md` の初期版を整備
@@ -107,9 +107,9 @@
 
 追加したサンプル:
 
-- [sample-dag-success.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-dag-success.yaml)
-- [sample-failure.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-failure.yaml)
-- [sample-timeout.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-timeout.yaml)
+- [sample-dag-success.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-dag-success.yaml)
+- [sample-failure.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-failure.yaml)
+- [sample-timeout.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-timeout.yaml)
 
 更新内容:
 
@@ -155,7 +155,7 @@
 
 - [remote-agent-design.md](/docs/remote-agent-design.md)
   - Agent Pull 型アーキテクチャを採用
-  - `postgen-agent` を新規バイナリとしてワークスペースに追加する構成
+  - `postjen-agent` を新規バイナリとしてワークスペースに追加する構成
   - ジョブ定義に `target.labels` を追加してエージェント割当を制御
   - `target` 未指定ノードは従来通りローカル実行（後方互換）
   - 通信フロー: 登録 → ポーリング → ログ送信 → 結果報告 → ハートビート
@@ -176,6 +176,6 @@
 1. 追加したサンプルを実際に実行して、`success` / `failed` / `timed_out` の各ケースを確認する
 2. サンプル実行結果を `usage.md` か別ドキュメントへ追記し、期待される挙動を明文化する
 3. リモートエージェント Phase 1: `agents` テーブル追加、エージェント管理 API 実装、`node_runs` への `assigned_agent_id` 追加
-4. リモートエージェント Phase 2: `postgen-agent` バイナリの雛形作成、ポーリング・実行・結果報告の基本フロー実装
+4. リモートエージェント Phase 2: `postjen-agent` バイナリの雛形作成、ポーリング・実行・結果報告の基本フロー実装
 5. Web UI Phase 1: フレームワーク選定、ダッシュボード（実行一覧）と実行詳細画面の実装
 6. `GET /api/runs` に `job_id` / `status` フィルタを追加（Web UI で必要）

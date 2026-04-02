@@ -1,4 +1,4 @@
-# postgen
+# postjen
 
 Rust で実装するジョブ実行サービスの MVP 雛形です。
 
@@ -13,7 +13,7 @@ sudo apt update
 sudo apt install -y build-essential pkg-config libssl-dev
 curl https://sh.rustup.rs -sSf | sh -s -- -y
 . "$HOME/.cargo/env"
-cargo run -p postgen-server
+cargo run -p postjen-server
 ```
 
 起動後の確認:
@@ -30,14 +30,14 @@ curl http://127.0.0.1:3000/api/health
 
 補足:
 
-- DB は既定で `sqlite:postgen.db` を使用する
+- DB は既定で `sqlite:postjen.db` を使用する
 - 起動時に `db/schema.sql` を元に SQLite スキーマを自動初期化する
 - `POST /api/jobs` でジョブ定義 YAML を DB に登録できる
 - 環境変数などの詳細は `usage.md` を参照する
 
 ## 構成
 
-- `crates/postgen-server`
+- `crates/postjen-server`
   - `axum` ベースの API サーバ
 - `db/schema.sql`
   - `SQLite` 初期 DDL

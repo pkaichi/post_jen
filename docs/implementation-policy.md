@@ -1300,7 +1300,7 @@ MVP では以下は DB に保存しない。
 
 #### 6-14. SQLite DDL
 
-MVP の初期 DDL は [schema.sql](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/db/schema.sql) とする。
+MVP の初期 DDL は [schema.sql](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/db/schema.sql) とする。
 
 ### 7. 成果物の扱い
 
@@ -1407,7 +1407,7 @@ MVP の実装は Rust workspace 構成で進める。
 ├── docs/
 │   └── implementation-policy.md
 └── crates/
-    └── postgen-server/
+    └── postjen-server/
         ├── Cargo.toml
         └── src/
             ├── config.rs

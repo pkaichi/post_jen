@@ -14,13 +14,13 @@
 - `POSTGEN_BIND_ADDR`
   - 省略時は `127.0.0.1:3000`
 - `POSTGEN_DATABASE_URL`
-  - 省略時は `sqlite:postgen.db`
+  - 省略時は `sqlite:postjen.db`
 
 例:
 
 ```bash
 export POSTGEN_BIND_ADDR=127.0.0.1:3000
-export POSTGEN_DATABASE_URL=sqlite:postgen.db
+export POSTGEN_DATABASE_URL=sqlite:postjen.db
 ```
 
 ## 実行手順
@@ -30,11 +30,11 @@ export POSTGEN_DATABASE_URL=sqlite:postgen.db
 3. サーバを起動する
 
 ```bash
-cd /mnt/c/Users/pkaichi/workspace/postjen/postgen_proj
-cargo run -p postgen-server
+cd /mnt/c/Users/pkaichi/workspace/postjen/postjen_proj
+cargo run -p postjen-server
 ```
 
-起動すると、SQLite スキーマは [schema.sql](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/db/schema.sql) を元に自動初期化される。
+起動すると、SQLite スキーマは [schema.sql](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/db/schema.sql) を元に自動初期化される。
 
 ## 基本フロー
 
@@ -49,15 +49,15 @@ cargo run -p postgen-server
 
 リポジトリには以下のサンプルを用意している。
 
-- [sample-hello.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-hello.yaml)
+- [sample-hello.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-hello.yaml)
   - 1 ノード成功の最小サンプル
   - ファイル出力と成果物確認を行う
-- [sample-dag-success.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-dag-success.yaml)
+- [sample-dag-success.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-dag-success.yaml)
   - 依存関係付き 2 ノード成功サンプル
   - `depends_on` による順次実行を確認できる
-- [sample-failure.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-failure.yaml)
+- [sample-failure.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-failure.yaml)
   - 失敗ノードと後続 `skipped` の確認用サンプル
-- [sample-timeout.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-timeout.yaml)
+- [sample-timeout.yaml](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-timeout.yaml)
   - ノードタイムアウト遷移の確認用サンプル
 
 ## API 利用例
@@ -85,7 +85,7 @@ curl http://127.0.0.1:3000/api/jobs
 ```bash
 curl -X POST http://127.0.0.1:3000/api/jobs \
   -H "Content-Type: application/json" \
-  -d '{"definition_path":"/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-hello.yaml","enabled":true}'
+  -d '{"definition_path":"/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-hello.yaml","enabled":true}'
 ```
 
 期待例:
@@ -95,7 +95,7 @@ curl -X POST http://127.0.0.1:3000/api/jobs \
   "job_id":"sample-hello",
   "name":"Sample Hello Job",
   "description":"Create a sample artifact and emit a simple log",
-  "definition_path":"/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/jobs/sample-hello.yaml",
+  "definition_path":"/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/jobs/sample-hello.yaml",
   "definition_hash":"...",
   "enabled":1,
   "created_at":"2026-03-14 12:00:00",
@@ -159,4 +159,4 @@ curl http://127.0.0.1:3000/api/runs/1/events
 
 - DB は `SQLite` を使用する
 - ジョブ定義の履歴管理は DB ではなく `git` 等に委ねる
-- 実行制約や状態遷移仕様は [implementation-policy.md](/mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/docs/implementation-policy.md) を参照する
+- 実行制約や状態遷移仕様は [implementation-policy.md](/mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/docs/implementation-policy.md) を参照する
