@@ -353,25 +353,38 @@ impl RunContext {
             None => return Ok(false),
         };
 
-        // Find an online agent that has all required labels
-        let agents = sqlx::query_as::<_, AgentRow>(
-            "SELECT agent_id, labels_json FROM agents WHERE status = 'online'"
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        // Find online agents, optionally filtered by name
+        let agents = if let Some(agent_name) = &target.agent {
+            sqlx::query_as::<_, AgentRow>(
+                "SELECT agent_id, name, labels_json FROM agents WHERE status = 'online' AND name = ?"
+            )
+            .bind(agent_name)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, AgentRow>(
+                "SELECT agent_id, name, labels_json FROM agents WHERE status = 'online'"
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         for agent in &agents {
-            let agent_labels: Vec<String> = serde_json::from_str(&agent.labels_json).unwrap_or_default();
-            let has_all_labels = target.labels.iter().all(|l| agent_labels.contains(l));
-            if has_all_labels {
-                sqlx::query("UPDATE node_runs SET assigned_agent_id = ? WHERE id = ?")
-                    .bind(&agent.agent_id)
-                    .bind(node_run_id)
-                    .execute(&self.pool)
-                    .await?;
-                info!(node_run_id, agent_id = %agent.agent_id, "assigned node to agent");
-                return Ok(true);
+            // If labels are specified, check they all match
+            if !target.labels.is_empty() {
+                let agent_labels: Vec<String> = serde_json::from_str(&agent.labels_json).unwrap_or_default();
+                let has_all_labels = target.labels.iter().all(|l| agent_labels.contains(l));
+                if !has_all_labels {
+                    continue;
+                }
             }
+            sqlx::query("UPDATE node_runs SET assigned_agent_id = ? WHERE id = ?")
+                .bind(&agent.agent_id)
+                .bind(node_run_id)
+                .execute(&self.pool)
+                .await?;
+            info!(node_run_id, agent_id = %agent.agent_id, agent_name = %agent.name, "assigned node to agent");
+            return Ok(true);
         }
 
         Ok(false)
@@ -738,6 +751,7 @@ struct QueuedRun {
 #[derive(Debug, FromRow)]
 struct AgentRow {
     agent_id: String,
+    name: String,
     labels_json: String,
 }
 

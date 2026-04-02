@@ -53,6 +53,7 @@ no_llvm_build
 /unicode-downloads
 /target
 postjen.db
+artifacts/
 examples/sample-work/
 /library/target
 /src/bootstrap/target

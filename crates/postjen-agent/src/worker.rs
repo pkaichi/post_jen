@@ -1,7 +1,8 @@
-use crate::client::{AgentClient, LogEntry, LogsReport, ResultReport, TaskInfo};
-use postjen_core::definition::ResolvedNodeDefinition;
+use crate::client::{AgentClient, ArtifactReport, LogEntry, LogsReport, ResultReport, TaskInfo};
+use postjen_core::definition::{ResolvedNodeDefinition, ResolvedNodeOutput};
 use postjen_core::executor;
 use std::collections::BTreeMap;
+use std::path::Path;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
 
@@ -14,7 +15,6 @@ pub async fn poll_loop(client: &AgentClient, token: &str, interval_secs: u64) {
                 info!(node_run_id = task.node_run_id, node_id = %task.node_id, "received task");
                 if let Err(error) = execute_task(client, token, &task).await {
                     error!(node_run_id = task.node_run_id, ?error, "task execution failed");
-                    // Report failure to server
                     let _ = client
                         .report_result(
                             token,
@@ -29,9 +29,7 @@ pub async fn poll_loop(client: &AgentClient, token: &str, interval_secs: u64) {
                         .await;
                 }
             }
-            Ok(None) => {
-                // No task available
-            }
+            Ok(None) => {}
             Err(error) => {
                 warn!(?error, "failed to poll task");
             }
@@ -47,6 +45,15 @@ async fn execute_task(client: &AgentClient, token: &str, task: &TaskInfo) -> any
         .map(|s| serde_json::from_str(s).unwrap_or_default())
         .unwrap_or_default();
 
+    let outputs: Vec<ResolvedNodeOutput> = task
+        .outputs
+        .iter()
+        .map(|o| ResolvedNodeOutput {
+            path: o.path.clone(),
+            required: o.required,
+        })
+        .collect();
+
     let node = ResolvedNodeDefinition {
         id: task.node_id.clone(),
         name: task.node_name.clone().unwrap_or_else(|| task.node_id.clone()),
@@ -57,7 +64,7 @@ async fn execute_task(client: &AgentClient, token: &str, task: &TaskInfo) -> any
         env,
         timeout_sec: task.timeout_sec as u64,
         retry: 0,
-        outputs: Vec::new(), // Outputs are checked after execution
+        outputs: outputs.clone(),
         target: None,
     };
 
@@ -90,8 +97,50 @@ async fn execute_task(client: &AgentClient, token: &str, task: &TaskInfo) -> any
             .await?;
     }
 
-    // Check artifacts (if we had output definitions - for now the server handles this)
-    // TODO: Pass output definitions from server to agent in task info
+    // Check and upload artifacts if execution succeeded
+    let mut final_status = outcome.status.clone();
+    let mut final_failure_reason = outcome.failure_reason.clone();
+    let mut artifact_reports = Vec::new();
+
+    if outcome.status == "success" && !outputs.is_empty() {
+        let artifact_results = executor::check_outputs(&outputs, &task.working_dir).await;
+
+        for artifact in &artifact_results {
+            artifact_reports.push(ArtifactReport {
+                path: artifact.path.clone(),
+                resolved_path: artifact.resolved_path.clone(),
+                required: artifact.required,
+                exists: artifact.exists,
+                size_bytes: artifact.size_bytes,
+            });
+
+            // Upload the file if it exists
+            if artifact.exists {
+                let resolved = Path::new(&artifact.resolved_path);
+                match tokio::fs::read(resolved).await {
+                    Ok(data) => {
+                        if let Err(e) = client
+                            .upload_artifact(token, task.node_run_id, &artifact.path, data)
+                            .await
+                        {
+                            warn!(path = %artifact.path, ?e, "failed to upload artifact");
+                        } else {
+                            info!(path = %artifact.path, "artifact uploaded");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(path = %artifact.resolved_path, ?e, "failed to read artifact file");
+                    }
+                }
+            }
+        }
+
+        // Check if required artifacts are missing
+        if let Some(reason) = executor::missing_artifacts_reason(&artifact_results) {
+            final_status = "failed".to_string();
+            final_failure_reason = Some(reason);
+        }
+    }
 
     // Report result
     client
@@ -99,17 +148,21 @@ async fn execute_task(client: &AgentClient, token: &str, task: &TaskInfo) -> any
             token,
             &ResultReport {
                 node_run_id: task.node_run_id,
-                status: outcome.status.clone(),
+                status: final_status.clone(),
                 exit_code: outcome.exit_code,
-                failure_reason: outcome.failure_reason.clone(),
-                artifacts: None,
+                failure_reason: final_failure_reason,
+                artifacts: if artifact_reports.is_empty() {
+                    None
+                } else {
+                    Some(artifact_reports)
+                },
             },
         )
         .await?;
 
     info!(
         node_run_id = task.node_run_id,
-        status = %outcome.status,
+        status = %final_status,
         "task completed"
     );
 

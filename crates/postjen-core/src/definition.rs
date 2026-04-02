@@ -27,6 +27,8 @@ pub struct JobDefaults {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeTarget {
+    pub agent: Option<String>,
+    #[serde(default)]
     pub labels: Vec<String>,
 }
 

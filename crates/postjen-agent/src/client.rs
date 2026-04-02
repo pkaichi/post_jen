@@ -25,6 +25,14 @@ pub struct TaskInfo {
     pub working_dir: String,
     pub env_json: Option<String>,
     pub timeout_sec: i64,
+    #[serde(default)]
+    pub outputs: Vec<TaskOutputDef>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskOutputDef {
+    pub path: String,
+    pub required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +174,39 @@ impl AgentClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             bail!("heartbeat failed: {} {}", status, body);
+        }
+
+        Ok(())
+    }
+
+    pub async fn upload_artifact(
+        &self,
+        token: &str,
+        node_run_id: i64,
+        artifact_path: &str,
+        file_data: Vec<u8>,
+    ) -> Result<()> {
+        let form = reqwest::multipart::Form::new()
+            .text("node_run_id", node_run_id.to_string())
+            .text("path", artifact_path.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(file_data).file_name(artifact_path.to_string()),
+            );
+
+        let resp = self
+            .client
+            .post(format!("{}/api/agent/artifacts", self.base_url))
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .context("failed to upload artifact")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("artifact upload failed: {} {}", status, body);
         }
 
         Ok(())

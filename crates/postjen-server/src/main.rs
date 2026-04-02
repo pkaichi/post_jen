@@ -19,7 +19,12 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
     runner::spawn(pool.clone());
-    let state = AppState { pool };
+    // Ensure artifacts directory exists
+    tokio::fs::create_dir_all(&config.artifacts_dir).await?;
+    let state = AppState {
+        pool,
+        artifacts_dir: config.artifacts_dir,
+    };
     let app = router(state);
 
     let listener = TcpListener::bind(config.bind_addr).await?;

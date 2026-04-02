@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
     routing::{get, post},
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
-use std::{convert::Infallible, fs, time::Duration};
+use std::{convert::Infallible, fs, path::PathBuf, time::Duration};
 use tokio::time::interval;
 use tokio_stream::{StreamExt, wrappers::IntervalStream};
 use tower_http::trace::TraceLayer;
@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
+    pub artifacts_dir: PathBuf,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -42,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agent/result", post(report_result))
         .route("/api/agent/logs", post(report_logs))
         .route("/api/agent/heartbeat", post(heartbeat))
+        .route("/api/agent/artifacts", post(upload_artifact))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -832,6 +834,21 @@ async fn authenticate_agent(pool: &SqlitePool, headers: &HeaderMap) -> Result<St
 }
 
 #[derive(Debug, Serialize, FromRow)]
+struct TaskRow {
+    node_run_id: i64,
+    job_run_id: i64,
+    node_id: String,
+    node_name: Option<String>,
+    program: String,
+    args_json: String,
+    working_dir: String,
+    env_json: Option<String>,
+    timeout_sec: i64,
+    definition_path: String,
+    job_id: String,
+}
+
+#[derive(Debug, Serialize)]
 struct TaskResponse {
     node_run_id: i64,
     job_run_id: i64,
@@ -842,6 +859,13 @@ struct TaskResponse {
     working_dir: String,
     env_json: Option<String>,
     timeout_sec: i64,
+    outputs: Vec<TaskOutputDef>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskOutputDef {
+    path: String,
+    required: bool,
 }
 
 async fn poll_task(
@@ -860,11 +884,13 @@ async fn poll_task(
     let _agent_labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
 
     // Find queued node_runs assigned to this agent
-    let task = sqlx::query_as::<_, TaskResponse>(
+    let task = sqlx::query_as::<_, TaskRow>(
         r#"
         SELECT nr.id AS node_run_id, nr.job_run_id, nr.node_id, nr.node_name,
-               nr.program, nr.args_json, nr.working_dir, nr.env_json, nr.timeout_sec
+               nr.program, nr.args_json, nr.working_dir, nr.env_json, nr.timeout_sec,
+               jr.definition_path, jr.job_id
         FROM node_runs nr
+        JOIN job_runs jr ON nr.job_run_id = jr.id
         WHERE nr.status = 'queued'
           AND nr.assigned_agent_id = ?
         ORDER BY nr.created_at ASC
@@ -877,6 +903,25 @@ async fn poll_task(
 
     match task {
         Some(task) => {
+            // Load outputs from job definition for this node
+            let outputs = match JobDefinition::load(&task.definition_path) {
+                Ok(def) => def
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == task.node_id)
+                    .map(|n| {
+                        n.outputs
+                            .iter()
+                            .map(|o| TaskOutputDef {
+                                path: o.path.clone(),
+                                required: o.required,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+
             // Mark as running
             sqlx::query("UPDATE node_runs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?")
                 .bind(task.node_run_id)
@@ -894,7 +939,20 @@ async fn poll_task(
             .execute(&state.pool)
             .await?;
 
-            Ok(Json(task).into_response())
+            let response = TaskResponse {
+                node_run_id: task.node_run_id,
+                job_run_id: task.job_run_id,
+                node_id: task.node_id,
+                node_name: task.node_name,
+                program: task.program,
+                args_json: task.args_json,
+                working_dir: task.working_dir,
+                env_json: task.env_json,
+                timeout_sec: task.timeout_sec,
+                outputs,
+            };
+
+            Ok(Json(response).into_response())
         }
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
@@ -1074,6 +1132,91 @@ async fn heartbeat(
         .bind(&agent_id)
         .execute(&state.pool)
         .await?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn upload_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<StatusCode, ApiError> {
+    let _agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    let mut node_run_id: Option<i64> = None;
+    let mut artifact_path: Option<String> = None;
+    let mut file_data: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("multipart error: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "node_run_id" => {
+                let text = field.text().await.map_err(|e| ApiError::bad_request(e.to_string()))?;
+                node_run_id = Some(text.parse::<i64>().map_err(|e| ApiError::bad_request(e.to_string()))?);
+            }
+            "path" => {
+                artifact_path = Some(field.text().await.map_err(|e| ApiError::bad_request(e.to_string()))?);
+            }
+            "file" => {
+                file_data = Some(field.bytes().await.map_err(|e| ApiError::bad_request(e.to_string()))?.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    let node_run_id = node_run_id.ok_or_else(|| ApiError::bad_request("node_run_id is required"))?;
+    let artifact_path = artifact_path.ok_or_else(|| ApiError::bad_request("path is required"))?;
+    let file_data = file_data.ok_or_else(|| ApiError::bad_request("file is required"))?;
+
+    let job_run_id = sqlx::query_scalar::<_, i64>(
+        "SELECT job_run_id FROM node_runs WHERE id = ?"
+    )
+    .bind(node_run_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("node run not found"))?;
+
+    // Store artifact: artifacts/{job_run_id}/{node_run_id}/{path}
+    let dest_dir = state.artifacts_dir
+        .join(job_run_id.to_string())
+        .join(node_run_id.to_string());
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to create artifact dir: {e}") })?;
+
+    let dest_path = dest_dir.join(&artifact_path);
+    // Ensure parent directory exists for nested paths
+    if let Some(parent) = dest_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to create dir: {e}") })?;
+    }
+
+    let size_bytes = file_data.len() as i64;
+    tokio::fs::write(&dest_path, &file_data)
+        .await
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to write artifact: {e}") })?;
+
+    // Record in DB
+    sqlx::query(
+        r#"
+        INSERT INTO run_artifacts (
+            job_run_id, node_run_id, path, resolved_path, required, exists_flag, size_bytes, checked_at
+        )
+        VALUES (?, ?, ?, ?, 1, 1, ?, CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(job_run_id)
+    .bind(node_run_id)
+    .bind(&artifact_path)
+    .bind(dest_path.to_string_lossy().to_string())
+    .bind(size_bytes)
+    .execute(&state.pool)
+    .await?;
 
     Ok(StatusCode::OK)
 }
