@@ -1,4 +1,5 @@
 use crate::definition::JobDefinition;
+use crate::http::resolve_secrets;
 use postjen_core::definition::ResolvedNodeDefinition;
 use postjen_core::executor;
 use postjen_core::types::NodeExecutionOutcome;
@@ -20,18 +21,19 @@ use tracing::{error, info, warn};
 const LOCAL_AGENT_ID: &str = "local";
 
 /// Register the built-in local agent and spawn all background workers.
-pub async fn spawn(pool: SqlitePool, artifacts_dir: PathBuf) -> Result<()> {
+pub async fn spawn(pool: SqlitePool, artifacts_dir: PathBuf, secret_key: Option<Vec<u8>>) -> Result<()> {
     register_local_agent(&pool).await?;
 
     // Spawn scheduler: picks queued runs, assigns nodes to agents
     let scheduler_pool = pool.clone();
+    let scheduler_secret_key = secret_key.clone();
     tokio::spawn(async move {
         let worker_lock = Arc::new(Mutex::new(()));
         let mut ticker = interval(Duration::from_secs(1));
         loop {
             ticker.tick().await;
             let _guard = worker_lock.lock().await;
-            if let Err(error) = process_next_run(&scheduler_pool).await {
+            if let Err(error) = process_next_run(&scheduler_pool, scheduler_secret_key.as_deref()).await {
                 error!(?error, "run worker iteration failed");
                 sleep(Duration::from_secs(1)).await;
             }
@@ -44,9 +46,22 @@ pub async fn spawn(pool: SqlitePool, artifacts_dir: PathBuf) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(1));
         loop {
             ticker.tick().await;
-            if let Err(error) = process_local_task(&worker_pool, &artifacts_dir).await {
-                error!(?error, "local worker iteration failed");
-                sleep(Duration::from_secs(1)).await;
+            // Spawn each task in its own tokio task for parallel execution
+            match pick_local_task(&worker_pool).await {
+                Ok(Some(task)) => {
+                    let task_pool = worker_pool.clone();
+                    let task_artifacts_dir = artifacts_dir.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = execute_local_task(&task_pool, &task_artifacts_dir, &task).await {
+                            error!(node_run_id = task.node_run_id, ?error, "local task execution failed");
+                        }
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    error!(?error, "local worker pick failed");
+                    sleep(Duration::from_secs(1)).await;
+                }
             }
         }
     });
@@ -95,7 +110,7 @@ async fn register_local_agent(pool: &SqlitePool) -> Result<()> {
 // Scheduler: assigns nodes to agents
 // ──────────────────────────────────────────────
 
-async fn process_next_run(pool: &SqlitePool) -> Result<()> {
+async fn process_next_run(pool: &SqlitePool, secret_key: Option<&[u8]>) -> Result<()> {
     let run = sqlx::query_as::<_, QueuedRun>(
         r#"
         SELECT id, job_id, definition_path
@@ -113,7 +128,7 @@ async fn process_next_run(pool: &SqlitePool) -> Result<()> {
     };
 
     info!(run_id = run.id, job_id = %run.job_id, "picked queued run");
-    if let Err(error) = execute_run(pool, &run).await {
+    if let Err(error) = execute_run(pool, &run, secret_key).await {
         error!(run_id = run.id, ?error, "run execution failed unexpectedly");
         fail_run_before_start(pool, run.id, format!("{error:#}")).await?;
     }
@@ -121,8 +136,8 @@ async fn process_next_run(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-async fn execute_run(pool: &SqlitePool, run: &QueuedRun) -> Result<()> {
-    let definition = JobDefinition::load(&run.definition_path)?;
+async fn execute_run(pool: &SqlitePool, run: &QueuedRun, secret_key: Option<&[u8]>) -> Result<()> {
+    let mut definition = JobDefinition::load(&run.definition_path)?;
     if definition.id != run.job_id {
         bail!(
             "job definition id mismatch: run has '{}', YAML has '{}'",
@@ -131,58 +146,129 @@ async fn execute_run(pool: &SqlitePool, run: &QueuedRun) -> Result<()> {
         );
     }
 
+    // Load run parameters and inject into node env
+    let params_json = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT params_json FROM job_runs WHERE id = ?"
+    )
+    .bind(run.id)
+    .fetch_one(pool)
+    .await?;
+
+    if let Some(json) = &params_json {
+        let params: HashMap<String, String> = serde_json::from_str(json).unwrap_or_default();
+        for node in &mut definition.nodes {
+            for (key, value) in &params {
+                node.env.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+
+    // Inject secrets into node env
+    if let Some(key) = secret_key {
+        for node in &mut definition.nodes {
+            if !node.secrets.is_empty() {
+                match resolve_secrets(pool, key, &node.secrets).await {
+                    Ok(secrets) => {
+                        for (name, value) in secrets {
+                            node.env.insert(name, value);
+                        }
+                    }
+                    Err(e) => {
+                        bail!("failed to resolve secrets for node '{}': {:?}", node.id, e);
+                    }
+                }
+            }
+        }
+    }
+
     let mut context = RunContext::new(pool.clone(), run.id).await?;
     context.ensure_nodes(&definition.nodes).await?;
     context.transition_job("queued", "running", None).await?;
 
     let mut results: HashMap<String, NodeCompletion> = HashMap::new();
+    let mut running_nodes: HashMap<String, i64> = HashMap::new(); // node_id -> node_run_id
     let mut stop_scheduling = false;
     let mut canceling = false;
 
-    for node in &definition.nodes {
+    loop {
         let should_cancel = context.is_cancel_requested().await?;
         if should_cancel {
             canceling = true;
         }
 
-        let blocked_by_dependency = node.depends_on.iter().find_map(|dep| {
-            results
-                .get(dep)
-                .filter(|result| result.status != "success")
-                .map(|result| (dep, result.status.as_str()))
-        });
+        // Find nodes that are ready to run (all dependencies satisfied, not yet started)
+        let mut newly_queued = Vec::new();
+        for node in &definition.nodes {
+            if results.contains_key(&node.id) || running_nodes.contains_key(&node.id) {
+                continue;
+            }
 
-        if let Some((dep, status)) = blocked_by_dependency {
-            context
-                .mark_node_skipped(node, format!("dependency '{}' ended with {}", dep, status))
-                .await?;
-            results.insert(node.id.clone(), NodeCompletion::new("skipped"));
-            continue;
+            let blocked_by_dependency = node.depends_on.iter().find_map(|dep| {
+                results
+                    .get(dep)
+                    .filter(|result| result.status != "success")
+                    .map(|result| (dep.clone(), result.status.clone()))
+            });
+
+            // Check if dependencies are still running (not yet resolved)
+            let waiting_on_dependency = node.depends_on.iter().any(|dep| {
+                !results.contains_key(dep)
+            });
+
+            if let Some((dep, status)) = blocked_by_dependency {
+                context
+                    .mark_node_skipped(node, format!("dependency '{}' ended with {}", dep, status))
+                    .await?;
+                results.insert(node.id.clone(), NodeCompletion::new("skipped"));
+                continue;
+            }
+
+            if waiting_on_dependency {
+                continue;
+            }
+
+            if stop_scheduling {
+                context
+                    .mark_node_skipped(node, "job execution already stopped".to_string())
+                    .await?;
+                results.insert(node.id.clone(), NodeCompletion::new("skipped"));
+                continue;
+            }
+
+            if canceling {
+                context
+                    .mark_node_skipped(node, "job cancellation requested".to_string())
+                    .await?;
+                results.insert(node.id.clone(), NodeCompletion::new("skipped"));
+                continue;
+            }
+
+            // Assign node to an agent
+            let node_run_id = context.node_run_id(&node.id)?;
+            let assigned = context.assign_to_agent(node_run_id, node).await?;
+            if assigned {
+                context.update_node_status(node_run_id, "pending", "queued", None, None, None, 0).await?;
+                newly_queued.push((node.id.clone(), node_run_id));
+            } else {
+                context.update_node_status(node_run_id, "pending", "failed", Some("no matching agent available"), None, None, 0).await?;
+                results.insert(node.id.clone(), NodeCompletion::new("failed"));
+                stop_scheduling = true;
+            }
         }
 
-        if stop_scheduling {
-            context
-                .mark_node_skipped(node, "job execution already stopped".to_string())
-                .await?;
-            results.insert(node.id.clone(), NodeCompletion::new("skipped"));
-            continue;
+        for (node_id, node_run_id) in newly_queued {
+            running_nodes.insert(node_id, node_run_id);
         }
 
-        if canceling {
-            context
-                .mark_node_skipped(node, "job cancellation requested".to_string())
-                .await?;
-            results.insert(node.id.clone(), NodeCompletion::new("skipped"));
-            continue;
+        // If nothing is running and no more nodes to schedule, we're done
+        if running_nodes.is_empty() {
+            break;
         }
 
-        // Assign node to an agent (local or remote)
-        let node_run_id = context.node_run_id(&node.id)?;
-        let assigned = context.assign_to_agent(node_run_id, node).await?;
-        if assigned {
-            context.update_node_status(node_run_id, "pending", "queued", None, None, None, 0).await?;
-            // Wait for agent (local or remote) to complete the node
-            let outcome = context.wait_for_agent_node(node_run_id).await?;
+        // Wait for any running node to complete
+        let completed = context.wait_for_any_node_completion(&running_nodes).await?;
+        if let Some((node_id, outcome)) = completed {
+            running_nodes.remove(&node_id);
             let is_terminal_failure = matches!(outcome.status.as_str(), "failed" | "timed_out" | "canceled");
             if is_terminal_failure {
                 stop_scheduling = true;
@@ -190,11 +276,7 @@ async fn execute_run(pool: &SqlitePool, run: &QueuedRun) -> Result<()> {
                     canceling = true;
                 }
             }
-            results.insert(node.id.clone(), NodeCompletion::from_status(&outcome.status));
-        } else {
-            context.update_node_status(node_run_id, "pending", "failed", Some("no matching agent available"), None, None, 0).await?;
-            results.insert(node.id.clone(), NodeCompletion::new("failed"));
-            stop_scheduling = true;
+            results.insert(node_id, NodeCompletion::from_status(&outcome.status));
         }
     }
 
@@ -249,7 +331,7 @@ async fn fail_run_before_start(pool: &SqlitePool, run_id: i64, reason: String) -
 // Local worker: executes tasks for built-in agent
 // ──────────────────────────────────────────────
 
-async fn process_local_task(pool: &SqlitePool, artifacts_dir: &PathBuf) -> Result<()> {
+async fn pick_local_task(pool: &SqlitePool) -> Result<Option<LocalTask>> {
     let task = sqlx::query_as::<_, LocalTask>(
         r#"
         SELECT nr.id AS node_run_id, nr.job_run_id, nr.node_id, nr.node_name,
@@ -267,19 +349,19 @@ async fn process_local_task(pool: &SqlitePool, artifacts_dir: &PathBuf) -> Resul
     .fetch_optional(pool)
     .await?;
 
-    let Some(task) = task else {
-        return Ok(());
-    };
+    // Immediately mark as running to prevent double-pick
+    if let Some(ref task) = task {
+        sqlx::query("UPDATE node_runs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'queued'")
+            .bind(task.node_run_id)
+            .execute(pool)
+            .await?;
+        insert_node_event(pool, task.job_run_id, task.node_run_id, "queued", "running", Some("picked by local agent")).await?;
+    }
 
-    info!(node_run_id = task.node_run_id, node_id = %task.node_id, "local worker picked task");
+    Ok(task)
+}
 
-    // Mark as running
-    sqlx::query("UPDATE node_runs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(task.node_run_id)
-        .execute(pool)
-        .await?;
-    insert_node_event(pool, task.job_run_id, task.node_run_id, "queued", "running", Some("picked by local agent")).await?;
-
+async fn execute_local_task(pool: &SqlitePool, artifacts_dir: &PathBuf, task: &LocalTask) -> Result<()> {
     // Build resolved node from task
     let args: Vec<String> = serde_json::from_str(&task.args_json).unwrap_or_default();
     let env: std::collections::BTreeMap<String, String> = task.env_json
@@ -308,6 +390,7 @@ async fn process_local_task(pool: &SqlitePool, artifacts_dir: &PathBuf) -> Resul
         retry: 0,
         outputs: outputs.clone(),
         target: None,
+        secrets: Vec::new(), // Already injected into env by scheduler
     };
 
     // Execute
@@ -576,35 +659,42 @@ impl RunContext {
         }
     }
 
-    async fn wait_for_agent_node(&self, node_run_id: i64) -> Result<NodeExecutionOutcome> {
+    async fn wait_for_any_node_completion(&self, running: &HashMap<String, i64>) -> Result<Option<(String, NodeExecutionOutcome)>> {
         loop {
-            let status = sqlx::query_scalar::<_, String>(
-                "SELECT status FROM node_runs WHERE id = ?"
-            )
-            .bind(node_run_id)
-            .fetch_one(&self.pool)
-            .await?;
+            for (node_id, &node_run_id) in running {
+                let status = sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM node_runs WHERE id = ?"
+                )
+                .bind(node_run_id)
+                .fetch_one(&self.pool)
+                .await?;
 
-            match status.as_str() {
-                "success" => return Ok(NodeExecutionOutcome::success(None)),
-                "failed" => {
-                    let reason = sqlx::query_scalar::<_, Option<String>>(
-                        "SELECT failure_reason FROM node_runs WHERE id = ?"
-                    )
-                    .bind(node_run_id)
-                    .fetch_one(&self.pool)
-                    .await?;
-                    return Ok(NodeExecutionOutcome::failed(reason.unwrap_or_else(|| "execution failed".to_string())));
-                }
-                "timed_out" => return Ok(NodeExecutionOutcome::timed_out()),
-                "canceled" => return Ok(NodeExecutionOutcome::canceled()),
-                _ => {
-                    if self.is_cancel_requested().await? {
-                        return Ok(NodeExecutionOutcome::canceled());
+                let outcome = match status.as_str() {
+                    "success" => Some(NodeExecutionOutcome::success(None)),
+                    "failed" => {
+                        let reason = sqlx::query_scalar::<_, Option<String>>(
+                            "SELECT failure_reason FROM node_runs WHERE id = ?"
+                        )
+                        .bind(node_run_id)
+                        .fetch_one(&self.pool)
+                        .await?;
+                        Some(NodeExecutionOutcome::failed(reason.unwrap_or_else(|| "execution failed".to_string())))
                     }
-                    sleep(Duration::from_secs(1)).await;
+                    "timed_out" => Some(NodeExecutionOutcome::timed_out()),
+                    "canceled" => Some(NodeExecutionOutcome::canceled()),
+                    _ => None,
+                };
+
+                if let Some(outcome) = outcome {
+                    return Ok(Some((node_id.clone(), outcome)));
                 }
             }
+
+            if self.is_cancel_requested().await? {
+                return Ok(Some(("".to_string(), NodeExecutionOutcome::canceled())));
+            }
+
+            sleep(Duration::from_secs(1)).await;
         }
     }
 

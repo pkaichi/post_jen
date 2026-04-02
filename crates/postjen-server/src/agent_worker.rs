@@ -66,6 +66,7 @@ async fn execute_task(client: &AgentClient, token: &str, task: &TaskInfo) -> any
         retry: 0,
         outputs: outputs.clone(),
         target: None,
+        secrets: Vec::new(),
     };
 
     // Execute the process

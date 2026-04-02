@@ -5,6 +5,14 @@ use std::{
     path::Path,
 };
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ParamDefinition {
+    pub name: String,
+    pub default: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobDefinition {
     pub version: u32,
@@ -13,7 +21,16 @@ pub struct JobDefinition {
     #[serde(rename = "description")]
     pub _description: Option<String>,
     pub defaults: Option<JobDefaults>,
+    pub params: Option<Vec<ParamDefinition>>,
+    pub triggers: Option<Triggers>,
     pub nodes: Vec<NodeDefinition>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Triggers {
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub webhook: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -45,6 +62,7 @@ pub struct NodeDefinition {
     pub retry: Option<u32>,
     pub outputs: Option<Vec<NodeOutput>>,
     pub target: Option<NodeTarget>,
+    pub secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +77,8 @@ pub struct ResolvedJobDefinition {
     pub name: String,
     pub description: Option<String>,
     pub working_dir: String,
+    pub params: Vec<ParamDefinition>,
+    pub triggers: Option<Triggers>,
     pub nodes: Vec<ResolvedNodeDefinition>,
 }
 
@@ -75,6 +95,8 @@ pub struct ResolvedNodeDefinition {
     pub retry: u32,
     pub outputs: Vec<ResolvedNodeOutput>,
     pub target: Option<NodeTarget>,
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +171,7 @@ impl JobDefinition {
                     })
                     .collect(),
                 target,
+                secrets: node.secrets.clone().unwrap_or_default(),
             });
         }
 
@@ -164,6 +187,8 @@ impl JobDefinition {
             name: self.name,
             description: self._description,
             working_dir,
+            params: self.params.unwrap_or_default(),
+            triggers: self.triggers,
             nodes: resolved_nodes,
         })
     }

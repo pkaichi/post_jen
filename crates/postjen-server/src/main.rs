@@ -5,6 +5,7 @@ mod db;
 mod definition;
 mod http;
 mod runner;
+mod scheduler;
 
 use anyhow::Result;
 use axum::serve;
@@ -47,7 +48,8 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
     tokio::fs::create_dir_all(&config.artifacts_dir).await?;
-    runner::spawn(pool.clone(), config.artifacts_dir.clone()).await?;
+    runner::spawn(pool.clone(), config.artifacts_dir.clone(), config.secret_key.clone()).await?;
+    scheduler::spawn(pool.clone());
 
     // If --connect-to is specified, also run as a remote agent for that controller
     if let Some(controller_url) = &args.connect_to {
@@ -86,6 +88,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         pool,
         artifacts_dir: config.artifacts_dir,
+        secret_key: config.secret_key,
     };
     let app = router(state);
 
