@@ -169,13 +169,118 @@
   - フレームワークは未確定、選定時の考慮点のみ記載
   - 3 フェーズの段階的導入計画
 
+### 9. プロジェクト名リネーム（postgen → postjen）
+
+Jenkins 後継の意図に合わせて、プロジェクト全体の名称を `postgen` から `postjen` に統一した。
+
+変更内容:
+
+- ディレクトリ名: `crates/postgen-server` → `crates/postjen-server`
+- パッケージ名: `postgen-server` → `postjen-server`
+- 環境変数: `POSTGEN_BIND_ADDR` → `POSTJEN_BIND_ADDR`, `POSTGEN_DATABASE_URL` → `POSTJEN_DATABASE_URL`
+- DB ファイル名: `postgen.db` → `postjen.db`
+- 全ドキュメント・サンプル YAML 内の表記を修正
+- `db.rs` に `create_if_missing(true)` を追加（DB 未作成時の起動エラー修正）
+
+関連ブランチとコミット:
+
+- `feature/proj_rename`
+
+### 10. リモートエージェント機能の実装
+
+[remote-agent-design.md](/docs/remote-agent-design.md) に基づき、Agent Pull 型のリモート実行機能を実装した。
+
+#### クレート構成の変更
+
+- `crates/postjen-core` を新設（共有ライブラリ）
+  - `definition.rs` — ジョブ定義パース・バリデーション・トポロジカルソート（サーバから移動）
+  - `executor.rs` — ノード実行ロジック（`run_process`, `check_outputs`）を DB 非依存で切り出し
+  - `types.rs` — `NodeExecutionOutcome`, `ArtifactResult` 等の共通型
+- `crates/postjen-agent` を新設（エージェントバイナリ）
+  - `client.rs` — サーバとの HTTP 通信（reqwest）
+  - `worker.rs` — ポーリング・実行・結果報告・ハートビートのループ処理
+  - CLI 引数: `--server-url`, `--name`, `--labels`, `--poll-interval`, `--heartbeat-interval`
+
+#### DB スキーマ拡張
+
+- `agents` テーブル追加（agent_id, name, hostname, labels_json, status, token_hash, last_heartbeat_at）
+- `node_runs` に `target_json`, `assigned_agent_id` カラム追加
+
+#### API 拡張
+
+エージェント管理 API（サーバ管理者向け）:
+
+- `GET /api/agents` — エージェント一覧
+- `POST /api/agents` — エージェント登録（トークン発行）
+- `GET /api/agents/:agent_id` — エージェント詳細
+- `DELETE /api/agents/:agent_id` — エージェント削除
+
+エージェント用 API（エージェントプロセスが使用、Bearer トークン認証）:
+
+- `GET /api/agent/task` — 割り当てられたタスクをポーリング（200 or 204）
+- `POST /api/agent/result` — ノード実行結果を報告
+- `POST /api/agent/logs` — 実行ログをバッチ送信
+- `POST /api/agent/heartbeat` — ハートビート送信
+
+#### ジョブ定義の拡張
+
+- `defaults.target` および `nodes[].target` に `labels` フィールドを追加
+- `target` 未指定ノードは従来通りサーバでローカル実行（後方互換）
+
+#### Runner スケジューリング拡張
+
+- `target` 付きノードはラベルが合致する online エージェントに割り当て
+- `wait_for_remote_node` でエージェントの結果報告をポーリング待機
+- リモートノード完了後、依存する後続ノードの実行を続行
+- ハートビート監視（15 秒間隔）でオフラインエージェントを検出し、該当ノードを `failed` に遷移
+
+#### E2E テスト結果
+
+`examples/jobs/sample-remote.yaml` を用いて、サーバ + エージェントの連携を localhost 上で検証した。
+
+- エージェント登録: 起動時に自動登録、`GET /api/agents` で status=online を確認
+- リモート実行: `remote-hello` ノードがエージェントで実行され、ログがサーバに記録された
+- 依存実行: `local-after-remote` ノードがリモートノード完了後にサーバでローカル実行された
+- ジョブ全体: status=success で完了
+- 状態遷移イベント: 全 9 イベントが正しい順序で記録された
+
+## 現時点の状態
+
+できること:
+
+- ジョブ定義 YAML の登録
+- 単一ジョブの実行
+- 同一ジョブ内ノードの依存付き順次実行
+- 実行履歴、イベント、ログの取得
+- 再実行レコードの作成
+- キャンセル要求状態への更新
+- リモートエージェントへのノード実行委譲（Agent Pull 型）
+- エージェントの登録・管理・ハートビート監視
+- ジョブ定義の `target.labels` によるエージェント割当制御
+
+未対応または今後の検討項目:
+
+- ジョブ間依存
+- ノード並列実行
+- 高度な再試行制御
+- Web UI の整備
+- 定義同期の自動化
+- 認証の強化（現在は共有シークレットなし、トークンのみ）
+- エージェントの自動再登録
+- 負荷分散の改善（現在は最初にマッチしたエージェントに割当）
+
+## メモ
+
+- サンプル実行用の生成物は `examples/sample-work/` などローカル出力で扱う
+- 生成物の ignore 設定と機能追加は、今後はコミットを分ける方針
+- 既存サンプル（sample-hello 等）の `working_dir` は WSL 向けパスのため、macOS では実行不可
+
 ## Next Actions
 
 優先度順の次アクション:
 
-1. 追加したサンプルを実際に実行して、`success` / `failed` / `timed_out` の各ケースを確認する
-2. サンプル実行結果を `usage.md` か別ドキュメントへ追記し、期待される挙動を明文化する
-3. リモートエージェント Phase 1: `agents` テーブル追加、エージェント管理 API 実装、`node_runs` への `assigned_agent_id` 追加
-4. リモートエージェント Phase 2: `postjen-agent` バイナリの雛形作成、ポーリング・実行・結果報告の基本フロー実装
-5. Web UI Phase 1: フレームワーク選定、ダッシュボード（実行一覧）と実行詳細画面の実装
-6. `GET /api/runs` に `job_id` / `status` フィルタを追加（Web UI で必要）
+1. Web UI Phase 1: フレームワーク選定、ダッシュボード（実行一覧）と実行詳細画面の実装
+2. 認証の強化: エージェント登録時の共有シークレット認可を追加
+3. エージェント負荷分散の改善（ラウンドロビン等）
+4. エージェントの自動再登録（切断後の復帰対応）
+5. 既存サンプルの `working_dir` を環境非依存なパスに修正

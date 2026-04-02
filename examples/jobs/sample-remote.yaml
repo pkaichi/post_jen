@@ -1,0 +1,26 @@
+version: 1
+id: sample-remote
+name: Sample Remote Execution
+description: Verify agent-based remote execution
+defaults:
+  working_dir: /tmp
+  timeout_sec: 30
+nodes:
+  - id: remote-hello
+    name: Run on agent
+    program: bash
+    args:
+      - -lc
+      - |
+        printf 'hello from agent on %s\n' "$(hostname)"
+    target:
+      labels: ["test"]
+
+  - id: local-after-remote
+    name: Run locally after remote
+    program: bash
+    args:
+      - -lc
+      - |
+        printf 'local follow-up\n'
+    depends_on: ["remote-hello"]

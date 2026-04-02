@@ -1,24 +1,22 @@
-use crate::definition::{JobDefinition, ResolvedNodeDefinition, ResolvedNodeOutput};
+use crate::definition::JobDefinition;
+use postjen_core::definition::ResolvedNodeDefinition;
+use postjen_core::executor;
+use postjen_core::types::NodeExecutionOutcome;
 use anyhow::{Context, Result, bail};
 use sqlx::{FromRow, SqlitePool};
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
-    io::AsyncReadExt,
-    process::Command,
     sync::Mutex,
     time::{interval, sleep},
 };
-use tracing::{error, info};
-
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+use tracing::{error, info, warn};
 
 pub fn spawn(pool: SqlitePool) {
+    let monitor_pool = pool.clone();
     tokio::spawn(async move {
         let worker_lock = Arc::new(Mutex::new(()));
         let mut ticker = interval(Duration::from_secs(1));
@@ -28,6 +26,20 @@ pub fn spawn(pool: SqlitePool) {
             if let Err(error) = process_next_run(&pool).await {
                 error!(?error, "run worker iteration failed");
                 sleep(Duration::from_secs(1)).await;
+            }
+        }
+    });
+
+    // Spawn agent monitor for heartbeat checking
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            if let Err(error) = check_agent_heartbeats(&monitor_pool).await {
+                error!(?error, "agent heartbeat check failed");
+            }
+            if let Err(error) = check_remote_node_completions(&monitor_pool).await {
+                error!(?error, "remote node completion check failed");
             }
         }
     });
@@ -76,8 +88,9 @@ async fn execute_run(pool: &SqlitePool, run: &QueuedRun) -> Result<()> {
     let mut results: HashMap<String, NodeCompletion> = HashMap::new();
     let mut stop_scheduling = false;
     let mut canceling = false;
+    let mut waiting_for_remote: Vec<(String, i64)> = Vec::new();
 
-    for (index, node) in definition.nodes.iter().enumerate() {
+    for node in &definition.nodes {
         let should_cancel = context.is_cancel_requested().await?;
         if should_cancel {
             canceling = true;
@@ -96,7 +109,7 @@ async fn execute_run(pool: &SqlitePool, run: &QueuedRun) -> Result<()> {
                 .await?;
             results.insert(
                 node.id.clone(),
-                NodeCompletion::new("skipped", None, Some(format!("dependency '{}' ended with {}", dep, status))),
+                NodeCompletion::new("skipped"),
             );
             continue;
         }
@@ -105,10 +118,7 @@ async fn execute_run(pool: &SqlitePool, run: &QueuedRun) -> Result<()> {
             context
                 .mark_node_skipped(node, "job execution already stopped".to_string())
                 .await?;
-            results.insert(
-                node.id.clone(),
-                NodeCompletion::new("skipped", None, Some("job execution already stopped".to_string())),
-            );
+            results.insert(node.id.clone(), NodeCompletion::new("skipped"));
             continue;
         }
 
@@ -116,13 +126,38 @@ async fn execute_run(pool: &SqlitePool, run: &QueuedRun) -> Result<()> {
             context
                 .mark_node_skipped(node, "job cancellation requested".to_string())
                 .await?;
-            results.insert(
-                node.id.clone(),
-                NodeCompletion::new("skipped", None, Some("job cancellation requested".to_string())),
-            );
+            results.insert(node.id.clone(), NodeCompletion::new("skipped"));
             continue;
         }
 
+        // Check if this node should be executed remotely
+        if node.target.is_some() {
+            let node_run_id = context.node_run_id(&node.id)?;
+            // Assign to a matching agent
+            let assigned = context.assign_to_agent(node_run_id, node).await?;
+            if assigned {
+                context.update_node_status(node_run_id, "pending", "queued", None, None, None, 0).await?;
+                waiting_for_remote.push((node.id.clone(), node_run_id));
+                // Wait for the remote node to complete
+                let outcome = context.wait_for_remote_node(node_run_id).await?;
+                let is_terminal_failure = matches!(outcome.status.as_str(), "failed" | "timed_out" | "canceled");
+                if is_terminal_failure {
+                    stop_scheduling = true;
+                    if outcome.status == "canceled" {
+                        canceling = true;
+                    }
+                }
+                results.insert(node.id.clone(), NodeCompletion::from_status(&outcome.status));
+            } else {
+                // No matching agent available - fail the node
+                context.update_node_status(node_run_id, "pending", "failed", Some("no matching agent available"), None, None, 0).await?;
+                results.insert(node.id.clone(), NodeCompletion::new("failed"));
+                stop_scheduling = true;
+            }
+            continue;
+        }
+
+        // Local execution (unchanged)
         let outcome = context.execute_node(node).await?;
         let is_terminal_failure = matches!(outcome.status.as_str(), "failed" | "timed_out" | "canceled");
         if is_terminal_failure {
@@ -133,14 +168,8 @@ async fn execute_run(pool: &SqlitePool, run: &QueuedRun) -> Result<()> {
         }
         results.insert(
             node.id.clone(),
-            NodeCompletion::new(outcome.status, outcome.exit_code, outcome.failure_reason),
+            NodeCompletion::from_status(&outcome.status),
         );
-
-        for remaining in definition.nodes.iter().skip(index + 1) {
-            if results.contains_key(&remaining.id) {
-                continue;
-            }
-        }
     }
 
     let final_status = determine_job_status(&results, canceling);
@@ -190,6 +219,72 @@ async fn fail_run_before_start(pool: &SqlitePool, run_id: i64, reason: String) -
     Ok(())
 }
 
+/// Check agent heartbeats and mark stale agents as offline
+async fn check_agent_heartbeats(pool: &SqlitePool) -> Result<()> {
+    // Mark agents offline if no heartbeat for 60 seconds
+    let updated = sqlx::query(
+        r#"
+        UPDATE agents
+        SET status = 'offline'
+        WHERE status = 'online'
+          AND datetime(last_heartbeat_at) < datetime('now', '-60 seconds')
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    if updated.rows_affected() > 0 {
+        warn!(count = updated.rows_affected(), "marked agents as offline due to heartbeat timeout");
+
+        // Fail running nodes assigned to offline agents
+        let failed_nodes = sqlx::query_as::<_, OfflineNodeRun>(
+            r#"
+            SELECT nr.id, nr.job_run_id
+            FROM node_runs nr
+            JOIN agents a ON nr.assigned_agent_id = a.agent_id
+            WHERE nr.status IN ('queued', 'running')
+              AND a.status = 'offline'
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        for node_run in &failed_nodes {
+            sqlx::query(
+                r#"
+                UPDATE node_runs
+                SET status = 'failed',
+                    finished_at = CURRENT_TIMESTAMP,
+                    failure_reason = 'agent went offline'
+                WHERE id = ?
+                "#,
+            )
+            .bind(node_run.id)
+            .execute(pool)
+            .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at)
+                VALUES (?, ?, 'node', 'status_changed', 'running', 'failed', 'agent went offline', CURRENT_TIMESTAMP)
+                "#,
+            )
+            .bind(node_run.job_run_id)
+            .bind(node_run.id)
+            .execute(pool)
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if any running jobs have all remote nodes completed
+async fn check_remote_node_completions(_pool: &SqlitePool) -> Result<()> {
+    // This is handled by wait_for_remote_node in the run loop
+    Ok(())
+}
+
 struct RunContext {
     pool: SqlitePool,
     run_id: i64,
@@ -223,13 +318,15 @@ impl RunContext {
                 Some(serde_json::to_string(&node.env)?)
             };
 
+            let target_json = node.target.as_ref().map(|t| serde_json::to_string(t).unwrap_or_default());
+
             let result = sqlx::query(
                 r#"
                 INSERT INTO node_runs (
                     job_run_id, node_id, node_name, status, program, args_json, working_dir,
-                    env_json, timeout_sec, retry_count
+                    env_json, timeout_sec, retry_count, target_json
                 )
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, 0)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, 0, ?)
                 "#,
             )
             .bind(self.run_id)
@@ -240,6 +337,7 @@ impl RunContext {
             .bind(&node.working_dir)
             .bind(env_json)
             .bind(i64::try_from(node.timeout_sec).context("timeout_sec exceeds i64")?)
+            .bind(target_json)
             .execute(&self.pool)
             .await?;
 
@@ -247,6 +345,69 @@ impl RunContext {
         }
 
         Ok(())
+    }
+
+    async fn assign_to_agent(&self, node_run_id: i64, node: &ResolvedNodeDefinition) -> Result<bool> {
+        let target = match &node.target {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+
+        // Find an online agent that has all required labels
+        let agents = sqlx::query_as::<_, AgentRow>(
+            "SELECT agent_id, labels_json FROM agents WHERE status = 'online'"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        for agent in &agents {
+            let agent_labels: Vec<String> = serde_json::from_str(&agent.labels_json).unwrap_or_default();
+            let has_all_labels = target.labels.iter().all(|l| agent_labels.contains(l));
+            if has_all_labels {
+                sqlx::query("UPDATE node_runs SET assigned_agent_id = ? WHERE id = ?")
+                    .bind(&agent.agent_id)
+                    .bind(node_run_id)
+                    .execute(&self.pool)
+                    .await?;
+                info!(node_run_id, agent_id = %agent.agent_id, "assigned node to agent");
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn wait_for_remote_node(&self, node_run_id: i64) -> Result<NodeExecutionOutcome> {
+        loop {
+            let status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM node_runs WHERE id = ?"
+            )
+            .bind(node_run_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+            match status.as_str() {
+                "success" => return Ok(NodeExecutionOutcome::success(None)),
+                "failed" => {
+                    let reason = sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT failure_reason FROM node_runs WHERE id = ?"
+                    )
+                    .bind(node_run_id)
+                    .fetch_one(&self.pool)
+                    .await?;
+                    return Ok(NodeExecutionOutcome::failed(reason.unwrap_or_else(|| "remote execution failed".to_string())));
+                }
+                "timed_out" => return Ok(NodeExecutionOutcome::timed_out()),
+                "canceled" => return Ok(NodeExecutionOutcome::canceled()),
+                _ => {
+                    // Check for job cancellation while waiting
+                    if self.is_cancel_requested().await? {
+                        return Ok(NodeExecutionOutcome::canceled());
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 
     async fn transition_job(
@@ -369,7 +530,8 @@ impl RunContext {
         let mut last_outcome = NodeExecutionOutcome::failed("node did not execute".to_string());
 
         while attempts < max_attempts {
-            let outcome = self.run_process(node).await?;
+            let outcome = executor::run_process(node, || false).await;
+
             let retryable = outcome.status == "failed" && attempts + 1 < max_attempts;
             let exit_code = outcome.exit_code;
 
@@ -377,8 +539,31 @@ impl RunContext {
                 .await?;
 
             if outcome.status == "success" {
-                let artifact_result = self.check_outputs(node_run_id, node, attempts).await?;
-                if let Some(reason) = artifact_result {
+                let artifact_results = executor::check_outputs(&node.outputs, &node.working_dir).await;
+                let missing_reason = executor::missing_artifacts_reason(&artifact_results);
+
+                // Record artifacts in DB
+                for artifact in &artifact_results {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO run_artifacts (
+                            job_run_id, node_run_id, path, resolved_path, required, exists_flag, size_bytes, checked_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        "#,
+                    )
+                    .bind(self.run_id)
+                    .bind(node_run_id)
+                    .bind(&artifact.path)
+                    .bind(&artifact.resolved_path)
+                    .bind(if artifact.required { 1 } else { 0 })
+                    .bind(if artifact.exists { 1 } else { 0 })
+                    .bind(artifact.size_bytes)
+                    .execute(&self.pool)
+                    .await?;
+                }
+
+                if let Some(reason) = missing_reason {
                     last_outcome = NodeExecutionOutcome {
                         status: "failed".to_string(),
                         exit_code,
@@ -387,6 +572,11 @@ impl RunContext {
                         stderr: outcome.stderr,
                     };
                 } else {
+                    sqlx::query("UPDATE node_runs SET retry_count = ? WHERE id = ?")
+                        .bind(i64::from(attempts))
+                        .bind(node_run_id)
+                        .execute(&self.pool)
+                        .await?;
                     last_outcome = NodeExecutionOutcome {
                         status: "success".to_string(),
                         exit_code,
@@ -426,136 +616,6 @@ impl RunContext {
         .await?;
 
         Ok(last_outcome)
-    }
-
-    async fn run_process(&self, node: &ResolvedNodeDefinition) -> Result<NodeExecutionOutcome> {
-        let mut command = Command::new(&node.program);
-        command
-            .args(&node.args)
-            .current_dir(&node.working_dir)
-            .envs(&node.env)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                return Ok(NodeExecutionOutcome::failed(format!(
-                    "failed to spawn process: {error}"
-                )));
-            }
-        };
-
-        let stdout_handle = child.stdout.take().map(|mut stdout| {
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let _ = stdout.read_to_end(&mut buf).await;
-                String::from_utf8_lossy(&buf).into_owned()
-            })
-        });
-        let stderr_handle = child.stderr.take().map(|mut stderr| {
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                let _ = stderr.read_to_end(&mut buf).await;
-                String::from_utf8_lossy(&buf).into_owned()
-            })
-        });
-
-        let started_at = Instant::now();
-        let deadline = Duration::from_secs(node.timeout_sec);
-
-        let status = loop {
-            if self.is_cancel_requested().await? {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                break NodeExecutionOutcome::canceled();
-            }
-
-            if started_at.elapsed() >= deadline {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                break NodeExecutionOutcome::timed_out();
-            }
-
-            if let Some(exit) = child.try_wait()? {
-                if exit.success() {
-                    break NodeExecutionOutcome::success(exit.code());
-                }
-                break NodeExecutionOutcome::failed_with_exit(
-                    exit.code(),
-                    format!("process exited with status {:?}", exit.code()),
-                );
-            }
-
-            sleep(POLL_INTERVAL).await;
-        };
-
-        let stdout = if let Some(handle) = stdout_handle {
-            handle.await.unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let stderr = if let Some(handle) = stderr_handle {
-            handle.await.unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        Ok(NodeExecutionOutcome {
-            stdout,
-            stderr,
-            ..status
-        })
-    }
-
-    async fn check_outputs(
-        &mut self,
-        node_run_id: i64,
-        node: &ResolvedNodeDefinition,
-        retries_used: u32,
-    ) -> Result<Option<String>> {
-        let mut missing = Vec::new();
-        for output in &node.outputs {
-            let resolved_path = resolve_output_path(&node.working_dir, output);
-            let metadata = tokio::fs::metadata(&resolved_path).await.ok();
-            let exists = metadata.is_some();
-            let size_bytes = metadata.and_then(|meta| i64::try_from(meta.len()).ok());
-            sqlx::query(
-                r#"
-                INSERT INTO run_artifacts (
-                    job_run_id, node_run_id, path, resolved_path, required, exists_flag, size_bytes, checked_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                "#,
-            )
-            .bind(self.run_id)
-            .bind(node_run_id)
-            .bind(&output.path)
-            .bind(resolved_path.to_string_lossy().to_string())
-            .bind(if output.required { 1 } else { 0 })
-            .bind(if exists { 1 } else { 0 })
-            .bind(size_bytes)
-            .execute(&self.pool)
-            .await?;
-
-            if output.required && !exists {
-                missing.push(output.path.clone());
-            }
-        }
-
-        if missing.is_empty() {
-            sqlx::query("UPDATE node_runs SET retry_count = ? WHERE id = ?")
-                .bind(i64::from(retries_used))
-                .bind(node_run_id)
-                .execute(&self.pool)
-                .await?;
-            Ok(None)
-        } else {
-            Ok(Some(format!(
-                "required outputs missing: {}",
-                missing.join(", ")
-            )))
-        }
     }
 
     async fn insert_process_logs(&mut self, node_run_id: i64, stdout: &str, stderr: &str) -> Result<()> {
@@ -675,83 +735,29 @@ struct QueuedRun {
     definition_path: String,
 }
 
+#[derive(Debug, FromRow)]
+struct AgentRow {
+    agent_id: String,
+    labels_json: String,
+}
+
+#[derive(Debug, FromRow)]
+struct OfflineNodeRun {
+    id: i64,
+    job_run_id: i64,
+}
+
 #[derive(Debug)]
 struct NodeCompletion {
     status: String,
 }
 
 impl NodeCompletion {
-    fn new(status: impl Into<String>, _exit_code: Option<i32>, _failure_reason: Option<String>) -> Self {
-        Self { status: status.into() }
-    }
-}
-
-#[derive(Debug)]
-struct NodeExecutionOutcome {
-    status: String,
-    exit_code: Option<i32>,
-    failure_reason: Option<String>,
-    stdout: String,
-    stderr: String,
-}
-
-impl NodeExecutionOutcome {
-    fn success(exit_code: Option<i32>) -> Self {
-        Self {
-            status: "success".to_string(),
-            exit_code,
-            failure_reason: None,
-            stdout: String::new(),
-            stderr: String::new(),
-        }
+    fn new(status: &str) -> Self {
+        Self { status: status.to_string() }
     }
 
-    fn failed(reason: String) -> Self {
-        Self {
-            status: "failed".to_string(),
-            exit_code: None,
-            failure_reason: Some(reason),
-            stdout: String::new(),
-            stderr: String::new(),
-        }
-    }
-
-    fn failed_with_exit(exit_code: Option<i32>, reason: String) -> Self {
-        Self {
-            status: "failed".to_string(),
-            exit_code,
-            failure_reason: Some(reason),
-            stdout: String::new(),
-            stderr: String::new(),
-        }
-    }
-
-    fn timed_out() -> Self {
-        Self {
-            status: "timed_out".to_string(),
-            exit_code: None,
-            failure_reason: Some("node timed out".to_string()),
-            stdout: String::new(),
-            stderr: String::new(),
-        }
-    }
-
-    fn canceled() -> Self {
-        Self {
-            status: "canceled".to_string(),
-            exit_code: None,
-            failure_reason: Some("node canceled".to_string()),
-            stdout: String::new(),
-            stderr: String::new(),
-        }
-    }
-}
-
-fn resolve_output_path(working_dir: &str, output: &ResolvedNodeOutput) -> PathBuf {
-    let path = Path::new(&output.path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        Path::new(working_dir).join(path)
+    fn from_status(status: &str) -> Self {
+        Self { status: status.to_string() }
     }
 }

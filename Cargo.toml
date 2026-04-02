@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/postjen-server"]
+members = ["crates/postjen-core", "crates/postjen-server", "crates/postjen-agent"]
 resolver = "2"
 
 [workspace.package]

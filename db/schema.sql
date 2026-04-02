@@ -46,6 +46,21 @@ CREATE TABLE IF NOT EXISTS job_runs (
     FOREIGN KEY (rerun_of_job_run_id) REFERENCES job_runs(id)
 );
 
+CREATE TABLE IF NOT EXISTS agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    hostname TEXT NOT NULL,
+    labels_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'online' CHECK (status IN ('online', 'offline')),
+    token_hash TEXT NOT NULL,
+    last_heartbeat_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+
 CREATE TABLE IF NOT EXISTS node_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_run_id INTEGER NOT NULL,
@@ -75,6 +90,8 @@ CREATE TABLE IF NOT EXISTS node_runs (
     finished_at TEXT,
     cancel_requested_at TEXT,
     failure_reason TEXT,
+    target_json TEXT,
+    assigned_agent_id TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (job_run_id) REFERENCES job_runs(id),
     UNIQUE (job_run_id, node_id)

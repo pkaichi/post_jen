@@ -1,11 +1,12 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
     routing::{get, post},
 };
 use crate::definition::JobDefinition;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -33,6 +34,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs/:run_id/logs", get(get_run_logs))
         .route("/api/runs/:run_id/events", get(get_run_events))
         .route("/api/runs/:run_id/stream", get(stream_run))
+        // Agent management API
+        .route("/api/agents", get(list_agents).post(register_agent))
+        .route("/api/agents/:agent_id", get(get_agent).delete(delete_agent))
+        // Agent worker API
+        .route("/api/agent/task", get(poll_task))
+        .route("/api/agent/result", post(report_result))
+        .route("/api/agent/logs", post(report_logs))
+        .route("/api/agent/heartbeat", post(heartbeat))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -694,6 +703,397 @@ struct RunForRerun {
     working_dir: String,
 }
 
+// ──────────────────────────────────────────────
+// Agent Management API
+// ──────────────────────────────────────────────
+
+#[derive(Debug, Serialize, FromRow)]
+struct AgentSummary {
+    agent_id: String,
+    name: String,
+    hostname: String,
+    labels_json: String,
+    status: String,
+    last_heartbeat_at: String,
+    registered_at: String,
+}
+
+async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentSummary>>, ApiError> {
+    let agents = sqlx::query_as::<_, AgentSummary>(
+        "SELECT agent_id, name, hostname, labels_json, status, last_heartbeat_at, registered_at FROM agents ORDER BY registered_at",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(agents))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterAgentRequest {
+    name: String,
+    hostname: String,
+    labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterAgentResponse {
+    agent_id: String,
+    token: String,
+}
+
+async fn register_agent(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterAgentRequest>,
+) -> Result<(StatusCode, Json<RegisterAgentResponse>), ApiError> {
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+
+    let agent_id = format!("agent-{}", generate_random_id());
+    let token = generate_token();
+    let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let labels = payload.labels.unwrap_or_default();
+    let labels_json = serde_json::to_string(&labels)
+        .map_err(|e| ApiError::bad_request(format!("invalid labels: {e}")))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO agents (agent_id, name, hostname, labels_json, token_hash)
+        VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(name)
+    .bind(&payload.hostname)
+    .bind(&labels_json)
+    .bind(&token_hash)
+    .execute(&state.pool)
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RegisterAgentResponse { agent_id, token }),
+    ))
+}
+
+async fn get_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentSummary>, ApiError> {
+    let agent = sqlx::query_as::<_, AgentSummary>(
+        "SELECT agent_id, name, hostname, labels_json, status, last_heartbeat_at, registered_at FROM agents WHERE agent_id = ?",
+    )
+    .bind(&agent_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match agent {
+        Some(a) => Ok(Json(a)),
+        None => Err(ApiError::not_found("agent not found")),
+    }
+}
+
+async fn delete_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let result = sqlx::query("DELETE FROM agents WHERE agent_id = ?")
+        .bind(&agent_id)
+        .execute(&state.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("agent not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ──────────────────────────────────────────────
+// Agent Worker API
+// ──────────────────────────────────────────────
+
+async fn authenticate_agent(pool: &SqlitePool, headers: &HeaderMap) -> Result<String, ApiError> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("missing or invalid Authorization header"))?;
+
+    let token_hash = format!("{:x}", Sha256::digest(auth.as_bytes()));
+    let agent_id = sqlx::query_scalar::<_, String>(
+        "SELECT agent_id FROM agents WHERE token_hash = ? AND status = 'online'"
+    )
+    .bind(&token_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: e.to_string() })?;
+
+    agent_id.ok_or_else(|| ApiError::unauthorized("invalid token or agent offline"))
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct TaskResponse {
+    node_run_id: i64,
+    job_run_id: i64,
+    node_id: String,
+    node_name: Option<String>,
+    program: String,
+    args_json: String,
+    working_dir: String,
+    env_json: Option<String>,
+    timeout_sec: i64,
+}
+
+async fn poll_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    // Get agent labels
+    let labels_json = sqlx::query_scalar::<_, String>(
+        "SELECT labels_json FROM agents WHERE agent_id = ?"
+    )
+    .bind(&agent_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let _agent_labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
+
+    // Find queued node_runs assigned to this agent
+    let task = sqlx::query_as::<_, TaskResponse>(
+        r#"
+        SELECT nr.id AS node_run_id, nr.job_run_id, nr.node_id, nr.node_name,
+               nr.program, nr.args_json, nr.working_dir, nr.env_json, nr.timeout_sec
+        FROM node_runs nr
+        WHERE nr.status = 'queued'
+          AND nr.assigned_agent_id = ?
+        ORDER BY nr.created_at ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(&agent_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match task {
+        Some(task) => {
+            // Mark as running
+            sqlx::query("UPDATE node_runs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?")
+                .bind(task.node_run_id)
+                .execute(&state.pool)
+                .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at)
+                VALUES (?, ?, 'node', 'status_changed', 'queued', 'running', 'picked by agent', CURRENT_TIMESTAMP)
+                "#,
+            )
+            .bind(task.job_run_id)
+            .bind(task.node_run_id)
+            .execute(&state.pool)
+            .await?;
+
+            Ok(Json(task).into_response())
+        }
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportResultRequest {
+    node_run_id: i64,
+    status: String,
+    exit_code: Option<i32>,
+    failure_reason: Option<String>,
+    artifacts: Option<Vec<ArtifactReport>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactReport {
+    path: String,
+    resolved_path: String,
+    required: bool,
+    exists: bool,
+    size_bytes: Option<i64>,
+}
+
+async fn report_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ReportResultRequest>,
+) -> Result<StatusCode, ApiError> {
+    let agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    // Verify the node is assigned to this agent and is running
+    let assigned = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT assigned_agent_id FROM node_runs WHERE id = ?"
+    )
+    .bind(payload.node_run_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .flatten();
+
+    if assigned.as_deref() != Some(&agent_id) {
+        return Err(ApiError::bad_request("node not assigned to this agent"));
+    }
+
+    let valid_statuses = ["success", "failed", "timed_out", "canceled"];
+    if !valid_statuses.contains(&payload.status.as_str()) {
+        return Err(ApiError::bad_request("invalid status"));
+    }
+
+    let finished = matches!(payload.status.as_str(), "success" | "failed" | "timed_out" | "canceled");
+
+    // Get job_run_id for events
+    let job_run_id = sqlx::query_scalar::<_, i64>(
+        "SELECT job_run_id FROM node_runs WHERE id = ?"
+    )
+    .bind(payload.node_run_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE node_runs
+        SET status = ?,
+            exit_code = ?,
+            failure_reason = ?,
+            finished_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE finished_at END
+        WHERE id = ?
+        "#,
+    )
+    .bind(&payload.status)
+    .bind(payload.exit_code)
+    .bind(payload.failure_reason.as_deref())
+    .bind(finished)
+    .bind(payload.node_run_id)
+    .execute(&state.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at)
+        VALUES (?, ?, 'node', 'status_changed', 'running', ?, ?, CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(job_run_id)
+    .bind(payload.node_run_id)
+    .bind(&payload.status)
+    .bind(payload.failure_reason.as_deref())
+    .execute(&state.pool)
+    .await?;
+
+    // Record artifacts if provided
+    if let Some(artifacts) = &payload.artifacts {
+        for artifact in artifacts {
+            sqlx::query(
+                r#"
+                INSERT INTO run_artifacts (
+                    job_run_id, node_run_id, path, resolved_path, required, exists_flag, size_bytes, checked_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                "#,
+            )
+            .bind(job_run_id)
+            .bind(payload.node_run_id)
+            .bind(&artifact.path)
+            .bind(&artifact.resolved_path)
+            .bind(if artifact.required { 1 } else { 0 })
+            .bind(if artifact.exists { 1 } else { 0 })
+            .bind(artifact.size_bytes)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportLogsRequest {
+    node_run_id: i64,
+    logs: Vec<LogEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogEntry {
+    stream: String,
+    content: String,
+}
+
+async fn report_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ReportLogsRequest>,
+) -> Result<StatusCode, ApiError> {
+    let _agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    let job_run_id = sqlx::query_scalar::<_, i64>(
+        "SELECT job_run_id FROM node_runs WHERE id = ?"
+    )
+    .bind(payload.node_run_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("node run not found"))?;
+
+    let mut next_sequence = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(sequence), 0) FROM run_logs WHERE job_run_id = ?"
+    )
+    .bind(job_run_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    for entry in &payload.logs {
+        next_sequence += 1;
+        sqlx::query(
+            r#"
+            INSERT INTO run_logs (job_run_id, node_run_id, stream, sequence, content, occurred_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .bind(job_run_id)
+        .bind(payload.node_run_id)
+        .bind(&entry.stream)
+        .bind(next_sequence)
+        .bind(&entry.content)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    sqlx::query("UPDATE agents SET last_heartbeat_at = CURRENT_TIMESTAMP, status = 'online' WHERE agent_id = ?")
+        .bind(&agent_id)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(StatusCode::OK)
+}
+
+fn generate_random_id() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 8] = rng.r#gen();
+    hex::encode(bytes)
+}
+
+fn generate_token() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.r#gen();
+    hex::encode(bytes)
+}
+
+// ──────────────────────────────────────────────
+// Error handling
+// ──────────────────────────────────────────────
+
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -721,6 +1121,12 @@ impl ApiError {
         }
     }
 
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<sqlx::Error> for ApiError {
