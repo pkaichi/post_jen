@@ -54,6 +54,8 @@ no_llvm_build
 /target
 postjen.db
 artifacts/
+crates/postjen-ui/dist/
+crates/postjen-ui/target/
 examples/sample-work/
 /library/target
 /src/bootstrap/target

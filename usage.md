@@ -79,12 +79,72 @@ cargo run -p postjen-server      cargo run -p postjen-server \   cargo run -p po
 - ジョブ定義の `target` でどのマシンで実行するかを制御する
 - 接続は B,C → A への Pull 型。A のポートのみ開放すればよい
 
-## 基本フロー
+## Web UI
+
+postjen-server を起動すると、ブラウザから Web UI にアクセスできる。
+
+```
+http://localhost:3000/
+```
+
+追加のプロセスやインストールは不要。サーバに UI が埋め込まれている。
+
+### 画面一覧
+
+| パス | 画面 | 説明 |
+|------|------|------|
+| `/` | ダッシュボード | 直近の実行一覧とジョブ一覧。10 秒間隔で自動更新 |
+| `/jobs/:job_id` | ジョブ詳細 | 実行履歴と Run ボタン |
+| `/runs/:run_id` | 実行詳細 | ノード状態、ログ、Cancel/Rerun。3 秒間隔で自動更新 |
+| `/agents` | エージェント一覧 | 全エージェントのステータス |
+| `/secrets` | シークレット一覧 | 登録済みシークレット（値は非表示） |
+
+### ダッシュボード
+
+- 直近の実行が一覧表示される（ID、ジョブ名、ステータス、トリガー、開始時刻）
+- 実行行をクリックすると実行詳細画面に遷移する
+- ジョブ一覧から [▶ Run] ボタンでジョブを即時実行できる
+- ジョブ名をクリックするとジョブ詳細画面に遷移する
+
+### 実行詳細
+
+- 実行のメタ情報（トリガー種別、パラメータ、開始/終了時刻、失敗理由）を表示
+- ノード実行状況が一覧表示される（ノード名、ステータス、割当エージェント、開始/終了時刻）
+- 実行ログがダークテーマのビューアで表示される（stdout は白、stderr は赤、system は青）
+- 実行中の run は 3 秒ごとに自動更新される
+- [Cancel] ボタンで実行中のジョブをキャンセルできる
+- [Rerun] ボタンで再実行を作成し、その詳細画面に遷移する
+
+### UI のビルド
+
+通常は事前ビルド済みの UI がサーバに埋め込まれているため、UI のビルドは不要。
+UI のソースを変更した場合は以下の手順でビルドする。
+
+前提:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install trunk
+```
+
+ビルド:
+
+```bash
+# UI をビルド
+cd crates/postjen-ui
+trunk build
+
+# サーバを再ビルド（UI 成果物を埋め込み）
+cd ../..
+cargo build -p postjen-server
+```
+
+## 基本フロー（API）
 
 1. ジョブ定義 YAML を用意する
 2. `POST /api/jobs` でジョブ定義を登録する
-3. `POST /api/jobs/:job_id/runs` で実行を作成する
-4. `GET /api/runs/:run_id` `logs` `events` で状態を確認する
+3. `POST /api/jobs/:job_id/runs` で実行を作成する（または Web UI の [▶ Run] ボタン）
+4. `GET /api/runs/:run_id` `logs` `events` で状態を確認する（または Web UI の実行詳細画面）
 
 ## サンプル定義
 

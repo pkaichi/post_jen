@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/postjen-core", "crates/postjen-server"]
+exclude = ["crates/postjen-ui"]
 resolver = "2"
 
 [workspace.package]

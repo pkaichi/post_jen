@@ -393,6 +393,56 @@ E2E テスト:
 - Webhook: `POST /api/webhook/sample-webhook` でパラメータ付きトリガー → success
 - Webhook 未有効ジョブへの呼び出し → 400 エラー `webhook trigger is not enabled`
 
+### 19. Web UI Phase 1 実装（Leptos）
+
+Leptos（Rust WASM フレームワーク）で Web UI を実装し、postjen-server にバイナリ埋め込みで配信する形で統合した。
+
+#### 技術構成
+
+- Leptos 0.6 CSR（Client-Side Rendering）モード
+- trunk によるビルド（WASM + JS + CSS を `dist/` に出力）
+- `include_dir` クレートでビルド成果物を postjen-server にバイナリ埋め込み
+- axum の fallback ハンドラで静的ファイルを配信（SPA ルーティング対応）
+
+#### クレート構成
+
+- `crates/postjen-ui/` を新設（ワークスペースからは `exclude` し、独立ビルド）
+- `crates/postjen-server/` に `include_dir` 依存追加、UI 配信ハンドラ追加
+
+#### 画面構成
+
+- **ダッシュボード** (`/`) — 直近の実行一覧 + ジョブ一覧（10 秒ポーリング更新）、ジョブ実行ボタン
+- **実行詳細** (`/runs/:run_id`) — メタ情報、ノード状態一覧、ログ表示（3 秒ポーリング更新）、Cancel/Rerun ボタン
+- **ジョブ詳細** (`/jobs/:job_id`) — 実行履歴、Run ボタン
+- **エージェント一覧** (`/agents`) — 全エージェントの名前・ホスト・ラベル・ステータス
+- **シークレット一覧** (`/secrets`) — 登録済みシークレット（値は非表示）
+
+#### API 追加
+
+- `GET /api/jobs/:job_id/definition` — ジョブ定義の生データ取得
+- `GET /api/runs/:run_id/nodes` — ノード実行一覧
+- `GET /api/runs/:run_id` に `params_json` をレスポンスに追加
+
+#### ビルド手順
+
+```bash
+# 1. UI ビルド
+cd crates/postjen-ui && trunk build
+
+# 2. サーバビルド（UI 成果物を自動埋め込み）
+cd ../.. && cargo build -p postjen-server
+```
+
+`cargo run -p postjen-server` だけでブラウザから `http://localhost:3000/` にアクセスして UI を利用可能。
+
+#### 動作確認
+
+- `http://localhost:3000/` で UI の index.html が配信されること
+- WASM/JS/CSS ファイルが正しく配信されること
+- `/runs/1` 等の SPA ルーティングで 200 が返ること（index.html フォールバック）
+- `/api/*` は既存の REST API がそのまま動作すること
+- ジョブの登録・実行・ログ確認が UI から操作可能なこと
+
 ## 現時点の状態
 
 できること:
@@ -412,12 +462,14 @@ E2E テスト:
 - シークレット管理（AES-256-GCM 暗号化保存、実行時注入）
 - Webhook トリガー（外部からの HTTP 呼び出しでジョブ実行）
 - Cron トリガー（スケジュール式によるジョブ自動実行）
+- Web UI（Leptos WASM SPA、サーバ埋め込み配信）
 
 未対応または今後の検討項目:
 
 - ジョブ間依存
 - 高度な再試行制御
-- Web UI の整備
+- Web UI Phase 2: パラメータ入力ダイアログ、DAG 可視化
+- Web UI Phase 3: シークレット登録/削除、ジョブ有効/無効切替
 - 定義同期の自動化
 - 認証の強化（エージェント登録、API アクセス制御）
 - エージェントの自動再登録（再起動時は新規登録になる）
@@ -432,13 +484,14 @@ E2E テスト:
 - 既存サンプル（sample-hello 等）の `working_dir` は WSL 向けパスのため、macOS では実行不可
 - コントローラーがリモートマシンより先に起動している必要がある
 - シークレット利用には `POSTJEN_SECRET_KEY` 環境変数（32 バイト hex）の設定が必要
+- UI ビルドには `rustup target add wasm32-unknown-unknown` と `cargo install trunk` が必要
 
 ## Next Actions
 
 優先度順の次アクション:
 
-1. Web UI Phase 1: フレームワーク選定、ダッシュボード（実行一覧）と実行詳細画面の実装
-2. シークレットのログマスク: `run_logs` 挿入時にシークレット値を `***` に置換
-3. 認証の強化: エージェント登録・API アクセスの認可
-4. エージェント負荷分散の改善（ラウンドロビン等）
-5. 既存サンプルの `working_dir` を環境非依存なパスに修正
+1. Web UI Phase 2: パラメータ入力ダイアログ、DAG 可視化
+2. Web UI Phase 3: シークレット登録/削除操作、ジョブ有効/無効切替
+3. シークレットのログマスク: `run_logs` 挿入時にシークレット値を `***` に置換
+4. 認証の強化: エージェント登録・API アクセスの認可
+5. エージェント負荷分散の改善（ラウンドロビン等）

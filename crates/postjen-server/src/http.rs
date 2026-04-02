@@ -1,10 +1,11 @@
 use axum::{
     Json, Router,
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
     routing::{get, post},
 };
+use include_dir::{include_dir, Dir};
 use crate::definition::JobDefinition;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -50,7 +51,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/secrets/:name", get(get_secret).delete(delete_secret))
         // Webhook trigger
         .route("/api/webhook/:job_id", post(webhook_trigger))
+        // UI API extensions
+        .route("/api/jobs/:job_id/definition", get(get_job_definition))
+        .route("/api/runs/:run_id/nodes", get(get_run_nodes))
         .with_state(state)
+        // UI static files fallback
+        .fallback(get(serve_ui))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -399,6 +405,7 @@ struct RunDetail {
     cancel_requested_at: Option<String>,
     rerun_of_job_run_id: Option<i64>,
     failure_reason: Option<String>,
+    params_json: Option<String>,
     created_at: String,
 }
 
@@ -410,7 +417,7 @@ async fn get_run(
         r#"
         SELECT id, job_id, job_name, status, trigger_type, triggered_by, definition_path, definition_hash,
                working_dir, queued_at, started_at, finished_at, cancel_requested_at,
-               rerun_of_job_run_id, failure_reason, created_at
+               rerun_of_job_run_id, failure_reason, params_json, created_at
         FROM job_runs
         WHERE id = ?
         "#,
@@ -1525,6 +1532,107 @@ async fn webhook_trigger(
     tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+// ──────────────────────────────────────────────
+// UI API extensions
+// ──────────────────────────────────────────────
+
+async fn get_job_definition(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row = sqlx::query_scalar::<_, String>(
+        "SELECT definition_path FROM job_definitions WHERE job_id = ?"
+    )
+    .bind(&job_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let path = match row {
+        Some(p) => p,
+        None => return Err(ApiError::not_found("job not found")),
+    };
+
+    let definition = JobDefinition::load(&path)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let json = serde_json::to_value(&definition)
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: e.to_string() })?;
+    Ok(Json(json))
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct NodeRunRow {
+    node_id: String,
+    node_name: Option<String>,
+    status: String,
+    assigned_agent_id: Option<String>,
+    exit_code: Option<i32>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    failure_reason: Option<String>,
+}
+
+async fn get_run_nodes(
+    State(state): State<AppState>,
+    Path(run_id): Path<i64>,
+) -> Result<Json<Vec<NodeRunRow>>, ApiError> {
+    let nodes = sqlx::query_as::<_, NodeRunRow>(
+        r#"
+        SELECT node_id, node_name, status, assigned_agent_id, exit_code, started_at, finished_at, failure_reason
+        FROM node_runs
+        WHERE job_run_id = ?
+        ORDER BY id ASC
+        "#,
+    )
+    .bind(run_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(nodes))
+}
+
+// ──────────────────────────────────────────────
+// UI static file serving
+// ──────────────────────────────────────────────
+
+static UI_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../postjen-ui/dist");
+
+async fn serve_ui(uri: Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+
+    match UI_DIR.get_file(path) {
+        Some(file) => {
+            let mime = mime_from_path(path);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime)],
+                file.contents(),
+            ).into_response()
+        }
+        None => {
+            // SPA fallback: serve index.html for all non-file routes
+            match UI_DIR.get_file("index.html") {
+                Some(file) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/html")],
+                    file.contents(),
+                ).into_response(),
+                None => (StatusCode::NOT_FOUND, "UI not built").into_response(),
+            }
+        }
+    }
+}
+
+fn mime_from_path(path: &str) -> &'static str {
+    if path.ends_with(".html") { "text/html" }
+    else if path.ends_with(".js") { "application/javascript" }
+    else if path.ends_with(".wasm") { "application/wasm" }
+    else if path.ends_with(".css") { "text/css" }
+    else if path.ends_with(".svg") { "image/svg+xml" }
+    else if path.ends_with(".png") { "image/png" }
+    else if path.ends_with(".ico") { "image/x-icon" }
+    else { "application/octet-stream" }
 }
 
 fn generate_random_id() -> String {
