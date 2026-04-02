@@ -52,7 +52,7 @@ no_llvm_build
 /dist/
 /unicode-downloads
 /target
-postgen.db
+postjen.db
 examples/sample-work/
 /library/target
 /src/bootstrap/target
