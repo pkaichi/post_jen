@@ -307,13 +307,99 @@ E2E テスト結果:
 - 成果物セクション: ローカル/リモート両方の保存フローを統一的に記載
 - ファイルパス: WSL 固有の絶対パスを相対パスに修正
 
+### 15. ビルドパラメータ
+
+ジョブ定義に `params` フィールドを追加し、実行時にパラメータを渡せるようにした。
+
+変更内容:
+
+- `JobDefinition` / `ResolvedJobDefinition` に `params: Vec<ParamDefinition>` を追加
+- `ParamDefinition` は `name`, `default`, `required` を持つ
+- `StartRunRequest` に `params: Option<HashMap<String, String>>` を追加
+- start_run() で required チェック・unknown パラメータ拒否を実施
+- `job_runs` に `params_json` カラム追加
+- execute_run() でパラメータをノードの環境変数にマージ
+
+E2E テスト:
+
+- パラメータ指定実行: `GREETING=hey TARGET=world` → `hey world` 出力
+- デフォルト値適用: `TARGET=postjen` のみ → `hello postjen` 出力
+- required 欠落: 400 エラー `required parameter 'TARGET' is missing`
+- unknown パラメータ: 400 エラー `unknown parameter 'UNKNOWN'`
+
+### 16. ノード並列実行
+
+DAG 上で依存関係のないノードを同時に実行できるようにした。
+
+変更内容:
+
+- execute_run() のメインループを書き換え
+  - 従来: トポロジカル順に 1 ノードずつ割当→待機
+  - 変更後: 準備完了ノードをすべて同時に割当し、いずれかの完了を待つループ
+- `wait_for_any_node_completion()` を新規追加
+- ローカルワーカーを `pick_local_task()` + `execute_local_task()` に分割
+  - pick 時に即座に running にマークし、tokio::spawn で並列実行
+
+E2E テスト:
+
+- 独立ノード A, B（各 sleep 2秒）+ 依存ノード C の構成
+- A, B が同時に queued → running になることをイベントのタイムスタンプで確認
+- C は A, B 完了後に実行、ジョブ全体 success
+
+### 17. シークレット管理
+
+AES-256-GCM 暗号化によるシークレットの安全な保存と、実行時の環境変数注入を実装した。
+
+変更内容:
+
+- `secrets` テーブル追加（name, encrypted_value, nonce）
+- シークレット API 追加
+  - `POST /api/secrets` — 登録（暗号化保存）
+  - `GET /api/secrets` — 一覧（値は非表示）
+  - `GET /api/secrets/:name` — 詳細（値は非表示）
+  - `DELETE /api/secrets/:name` — 削除
+- `NodeDefinition` / `ResolvedNodeDefinition` に `secrets: Vec<String>` 追加
+- execute_run() でシークレットを DB から復号し、ノードの環境変数に注入
+- `POSTJEN_SECRET_KEY` 環境変数（32 バイト hex）で暗号化キーを設定
+
+E2E テスト:
+
+- `DB_PASSWORD=super_secret_123`, `API_KEY=key_abc_456` を登録
+- ジョブ定義で `secrets: ["DB_PASSWORD", "API_KEY"]` を参照
+- 実行ログに `DB=super_secret_123 API=key_abc_456` が出力されることを確認
+- 一覧 API ではシークレット値が非表示であることを確認
+
+### 18. トリガー機構（Webhook / Cron）
+
+外部システムからの Webhook とスケジュール実行（cron）によるジョブ自動トリガーを実装した。
+
+変更内容:
+
+- `JobDefinition` に `triggers: Option<Triggers>` 追加
+  - `Triggers { cron: Option<String>, webhook: bool }`
+- `POST /api/webhook/:job_id` エンドポイント追加
+  - webhook が有効なジョブのみ受付
+  - パラメータの受け渡しにも対応
+  - trigger_type = "webhook"
+- `scheduler.rs` を新規作成
+  - 30 秒間隔で全ジョブの cron 式を評価
+  - マッチした場合に run を自動作成（trigger_type = "cron"）
+  - `last_triggered_at` で重複実行を防止
+- `job_definitions` に `triggers_json`, `last_triggered_at` カラム追加
+- register_job() で triggers_json を保存
+
+E2E テスト:
+
+- Webhook: `POST /api/webhook/sample-webhook` でパラメータ付きトリガー → success
+- Webhook 未有効ジョブへの呼び出し → 400 エラー `webhook trigger is not enabled`
+
 ## 現時点の状態
 
 できること:
 
 - ジョブ定義 YAML の登録
 - 単一ジョブの実行（ビルトインローカルエージェント経由）
-- 同一ジョブ内ノードの依存付き順次実行
+- DAG ベースのノード並列実行
 - 実行履歴、イベント、ログの取得
 - 再実行レコードの作成
 - キャンセル要求状態への更新
@@ -322,17 +408,22 @@ E2E テスト結果:
 - エージェントの登録・管理・ハートビート監視・オフライン検出
 - 成果物のエージェント→コントローラーアップロード
 - 単一バイナリ（`postjen-server`）でサーバ＋エージェントの両役割
+- ビルドパラメータ（実行時にパラメータを渡して環境変数注入）
+- シークレット管理（AES-256-GCM 暗号化保存、実行時注入）
+- Webhook トリガー（外部からの HTTP 呼び出しでジョブ実行）
+- Cron トリガー（スケジュール式によるジョブ自動実行）
 
 未対応または今後の検討項目:
 
 - ジョブ間依存
-- ノード並列実行
 - 高度な再試行制御
 - Web UI の整備
 - 定義同期の自動化
-- 認証の強化（現在は共有シークレットなし、トークンのみ）
+- 認証の強化（エージェント登録、API アクセス制御）
 - エージェントの自動再登録（再起動時は新規登録になる）
 - 負荷分散の改善（現在は最初にマッチしたエージェントに割当）
+- シークレットのログマスク（`run_logs` にシークレット値が平文で残る）
+- 条件付き実行（`when` による実行スキップ）
 
 ## メモ
 
@@ -340,13 +431,14 @@ E2E テスト結果:
 - 生成物の ignore 設定と機能追加は、今後はコミットを分ける方針
 - 既存サンプル（sample-hello 等）の `working_dir` は WSL 向けパスのため、macOS では実行不可
 - コントローラーがリモートマシンより先に起動している必要がある
+- シークレット利用には `POSTJEN_SECRET_KEY` 環境変数（32 バイト hex）の設定が必要
 
 ## Next Actions
 
 優先度順の次アクション:
 
 1. Web UI Phase 1: フレームワーク選定、ダッシュボード（実行一覧）と実行詳細画面の実装
-2. 認証の強化: エージェント登録時の共有シークレット認可を追加
-3. エージェント負荷分散の改善（ラウンドロビン等）
-4. エージェントの自動再登録（切断後の復帰対応）
+2. シークレットのログマスク: `run_logs` 挿入時にシークレット値を `***` に置換
+3. 認証の強化: エージェント登録・API アクセスの認可
+4. エージェント負荷分散の改善（ラウンドロビン等）
 5. 既存サンプルの `working_dir` を環境非依存なパスに修正

@@ -16,6 +16,7 @@
 | `POSTJEN_BIND_ADDR` | `127.0.0.1:3000` | リッスンアドレス |
 | `POSTJEN_DATABASE_URL` | `sqlite:postjen.db` | SQLite パス |
 | `POSTJEN_ARTIFACTS_DIR` | `artifacts` | 成果物の保存先ディレクトリ |
+| `POSTJEN_SECRET_KEY` | なし | シークレット暗号化キー（32 バイト hex 文字列） |
 
 例:
 
@@ -23,6 +24,7 @@
 export POSTJEN_BIND_ADDR=0.0.0.0:3000
 export POSTJEN_DATABASE_URL=sqlite:postjen.db
 export POSTJEN_ARTIFACTS_DIR=/var/postjen/artifacts
+export POSTJEN_SECRET_KEY=$(python3 -c "import os; print(os.urandom(32).hex())")
 ```
 
 ## 起動
@@ -172,6 +174,225 @@ curl "http://127.0.0.1:3000/api/runs/1/logs?limit=100"
 ```bash
 curl http://127.0.0.1:3000/api/runs/1/events
 ```
+
+## ビルドパラメータ
+
+ジョブ定義に `params` を定義し、実行時にパラメータを渡すことができる。パラメータはノードの環境変数として注入される。
+
+### ジョブ定義
+
+```yaml
+version: 1
+id: my-build
+name: Parameterized Build
+params:
+  - name: BRANCH
+    default: "main"
+  - name: VERSION
+    required: true
+defaults:
+  working_dir: /opt/repos/sample
+  timeout_sec: 300
+nodes:
+  - id: build
+    program: bash
+    args: ["-c", "git checkout $BRANCH && make build VERSION=$VERSION"]
+```
+
+| 項目 | 型 | 必須 | 説明 |
+|------|-----|------|------|
+| `name` | string | 必須 | パラメータ名。ノードの環境変数名として使用される |
+| `default` | string | 任意 | デフォルト値。未指定かつ required でない場合は注入されない |
+| `required` | bool | 任意 | true の場合、実行時に値の指定が必須。デフォルト: false |
+
+### 実行時のパラメータ指定
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/jobs/my-build/runs \
+  -H "Content-Type: application/json" \
+  -d '{"trigger_type":"manual","params":{"BRANCH":"develop","VERSION":"1.2.3"}}'
+```
+
+- `required: true` のパラメータが未指定の場合、400 エラーになる
+- 定義にないパラメータを渡した場合も 400 エラーになる
+- `default` が設定されていて実行時に未指定の場合、デフォルト値が使われる
+- パラメータはノードの環境変数にマージされる（ノードの `env` に同名がある場合、ノードの値が優先）
+
+## ノード並列実行
+
+DAG の依存関係に基づき、独立したノードは同時に実行される。
+
+### 動作
+
+- 依存関係のないノードはすべて同時にエージェントに割り当てられる
+- いずれかのノードが完了すると、新たに依存が解決されたノードが割り当てられる
+- 1 ノードでも失敗すると、新たなノード起動は停止し、未実行ノードは `skipped` になる
+
+### 例
+
+```yaml
+nodes:
+  - id: test-unit
+    program: make
+    args: ["test-unit"]
+
+  - id: test-integration
+    program: make
+    args: ["test-integration"]
+
+  - id: build
+    program: make
+    args: ["build"]
+    depends_on: ["test-unit", "test-integration"]
+```
+
+この定義では `test-unit` と `test-integration` が同時に実行され、両方が成功した後に `build` が実行される。
+
+## シークレット管理
+
+パスワードやAPIキー等のシークレットを暗号化して保存し、実行時にノードの環境変数として注入できる。
+
+### 前提
+
+シークレット機能を使用するには `POSTJEN_SECRET_KEY` 環境変数の設定が必要。
+
+```bash
+# 32 バイトのランダムな hex 文字列を生成
+export POSTJEN_SECRET_KEY=$(python3 -c "import os; print(os.urandom(32).hex())")
+```
+
+### シークレットの登録
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/secrets \
+  -H "Content-Type: application/json" \
+  -d '{"name":"DB_PASSWORD","value":"super_secret_123"}'
+```
+
+値は AES-256-GCM で暗号化されて DB に保存される。
+
+### シークレットの一覧
+
+```bash
+curl http://127.0.0.1:3000/api/secrets
+```
+
+値は表示されない。名前と登録日時のみ返却される。
+
+### シークレットの削除
+
+```bash
+curl -X DELETE http://127.0.0.1:3000/api/secrets/DB_PASSWORD
+```
+
+### ジョブ定義での使用
+
+ノードの `secrets` フィールドで使用するシークレット名を指定する。
+
+```yaml
+nodes:
+  - id: deploy
+    program: bash
+    args: ["-c", "./deploy.sh"]
+    secrets: ["DB_PASSWORD", "API_KEY"]
+```
+
+実行時に指定されたシークレットが復号され、ノードの環境変数として注入される。
+上の例では `$DB_PASSWORD` と `$API_KEY` が使用可能になる。
+
+### 注意事項
+
+- 存在しないシークレットを参照するとジョブは失敗する
+- 現時点ではシークレット値が実行ログに平文で残る可能性がある（ログマスクは未実装）
+- シークレットキーを変更すると既存のシークレットは復号できなくなるため、再登録が必要
+
+## トリガー
+
+### Webhook
+
+外部システム（GitHub, GitLab 等）からの HTTP 呼び出しでジョブを自動実行できる。
+
+#### ジョブ定義
+
+```yaml
+version: 1
+id: my-ci
+name: CI Pipeline
+triggers:
+  webhook: true
+params:
+  - name: BRANCH
+    default: "main"
+defaults:
+  working_dir: /opt/repos/sample
+  timeout_sec: 300
+nodes:
+  - id: build
+    program: bash
+    args: ["-c", "git checkout $BRANCH && make build"]
+```
+
+`triggers.webhook: true` を指定すると、Webhook エンドポイントが有効になる。
+
+#### Webhook の呼び出し
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/webhook/my-ci \
+  -H "Content-Type: application/json" \
+  -d '{"params":{"BRANCH":"develop"},"triggered_by":"github"}'
+```
+
+- `trigger_type` は自動的に `webhook` に設定される
+- `params` でビルドパラメータを渡せる
+- `triggered_by` で呼び出し元を記録できる
+- リクエストボディは省略可能
+- `triggers.webhook` が有効でないジョブへの呼び出しは 400 エラーになる
+
+### Cron スケジュール
+
+ジョブ定義に cron 式を指定すると、スケジュールに従って自動実行される。
+
+#### ジョブ定義
+
+```yaml
+version: 1
+id: nightly-build
+name: Nightly Build
+triggers:
+  cron: "0 0 3 * * *"    # 毎日 3:00 (秒 分 時 日 月 曜日)
+defaults:
+  working_dir: /opt/repos/sample
+  timeout_sec: 1800
+nodes:
+  - id: build
+    program: make
+    args: ["build"]
+```
+
+#### cron 式のフォーマット
+
+6 フィールド形式（秒を含む）:
+
+```
+秒 分 時 日 月 曜日
+```
+
+例:
+
+| 式 | 意味 |
+|----|------|
+| `0 0 3 * * *` | 毎日 3:00:00 |
+| `0 */30 * * * *` | 30 分ごと |
+| `0 0 0 * * Mon` | 毎週月曜 0:00 |
+| `0 0 9,18 * * Mon-Fri` | 平日 9:00 と 18:00 |
+
+#### 動作仕様
+
+- サーバは 30 秒間隔で全ジョブの cron 式を評価する
+- 前回実行時刻以降にスケジュール時刻が到来していれば run を自動作成する
+- `trigger_type` は `cron`、`triggered_by` は `scheduler` に設定される
+- ジョブが `enabled: false` の場合はトリガーされない
+- Webhook と cron は同時に設定できる
 
 ## リモート実行
 
@@ -428,10 +649,11 @@ cat artifacts/1/1/dist/app.tar.gz
 - `POST /api/runs/:run_id/cancel` はキャンセル要求状態への更新までを行う
 - `POST /api/runs/:run_id/rerun` は再実行レコード作成までを行う
 - `GET /api/runs/:run_id/stream` は現在の状態スナップショットを SSE で返す
-- 実行エンジンは順次実行の実装であり、並列実行や高度な再試行制御は未対応
 - ジョブ間依存は未対応で、連結できるのは同一ジョブ内のノード依存のみ
 - エージェント登録は認可なしで誰でも可能（共有シークレットによる制限は未実装）
 - エージェントの負荷分散は未実装（合致する最初のエージェントに割り当て）
+- シークレット値が実行ログに平文で残る可能性がある（ログマスクは未実装）
+- 条件付き実行（`when` による実行スキップ）は未対応
 
 ## 補足
 
