@@ -1,4 +1,4 @@
-use crate::client::{AgentClient, ArtifactReport, LogEntry, LogsReport, ResultReport, TaskInfo};
+use crate::agent_client::{AgentClient, ArtifactReport, LogEntry, LogsReport, ResultReport, TaskInfo};
 use postjen_core::definition::{ResolvedNodeDefinition, ResolvedNodeOutput};
 use postjen_core::executor;
 use std::collections::BTreeMap;

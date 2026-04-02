@@ -1184,22 +1184,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
-name = "postjen-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "postjen-core",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "postjen-core"
 version = "0.1.0"
 dependencies = [
@@ -1217,9 +1201,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "clap",
  "hex",
  "postjen-core",
  "rand",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
