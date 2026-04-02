@@ -1,16 +1,17 @@
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    extract::{Multipart, Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
     routing::{get, post},
 };
 use crate::definition::JobDefinition;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
-use std::{convert::Infallible, fs, time::Duration};
+use std::{convert::Infallible, fs, path::PathBuf, time::Duration};
 use tokio::time::interval;
 use tokio_stream::{StreamExt, wrappers::IntervalStream};
 use tower_http::trace::TraceLayer;
@@ -18,6 +19,8 @@ use tower_http::trace::TraceLayer;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
+    pub artifacts_dir: PathBuf,
+    pub secret_key: Option<Vec<u8>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -33,6 +36,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs/:run_id/logs", get(get_run_logs))
         .route("/api/runs/:run_id/events", get(get_run_events))
         .route("/api/runs/:run_id/stream", get(stream_run))
+        // Agent management API
+        .route("/api/agents", get(list_agents).post(register_agent))
+        .route("/api/agents/:agent_id", get(get_agent).delete(delete_agent))
+        // Agent worker API
+        .route("/api/agent/task", get(poll_task))
+        .route("/api/agent/result", post(report_result))
+        .route("/api/agent/logs", post(report_logs))
+        .route("/api/agent/heartbeat", post(heartbeat))
+        .route("/api/agent/artifacts", post(upload_artifact))
+        // Secrets API
+        .route("/api/secrets", get(list_secrets).post(create_secret))
+        .route("/api/secrets/:name", get(get_secret).delete(delete_secret))
+        // Webhook trigger
+        .route("/api/webhook/:job_id", post(webhook_trigger))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -99,6 +116,8 @@ async fn register_job(
         .map_err(|error| ApiError::bad_request(format!("failed to read definition file: {error}")))?;
     let definition_hash = format!("{:x}", Sha256::digest(definition_contents));
     let enabled = if payload.enabled.unwrap_or(true) { 1_i64 } else { 0_i64 };
+    let triggers_json = definition.triggers.as_ref()
+        .map(|t| serde_json::to_string(t).unwrap_or_default());
 
     let existing = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM job_definitions WHERE job_id = ?")
         .bind(&definition.id)
@@ -114,15 +133,16 @@ async fn register_job(
     sqlx::query(
         r#"
         INSERT INTO job_definitions (
-            job_id, name, description, definition_path, definition_hash, enabled
+            job_id, name, description, definition_path, definition_hash, enabled, triggers_json
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
             definition_path = excluded.definition_path,
             definition_hash = excluded.definition_hash,
             enabled = excluded.enabled,
+            triggers_json = excluded.triggers_json,
             updated_at = CURRENT_TIMESTAMP
         "#,
     )
@@ -132,6 +152,7 @@ async fn register_job(
     .bind(definition_path)
     .bind(&definition_hash)
     .bind(enabled)
+    .bind(&triggers_json)
     .execute(&mut *tx)
     .await?;
 
@@ -188,7 +209,10 @@ async fn get_job(
 struct StartRunRequest {
     trigger_type: Option<String>,
     triggered_by: Option<String>,
+    params: Option<HashMap<String, String>>,
 }
+
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, FromRow)]
 struct StartRunResponse {
@@ -234,15 +258,40 @@ async fn start_run(
     let definition = JobDefinition::load(&job.definition_path)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let working_dir = definition.working_dir;
+
+    // Validate and resolve parameters
+    let run_params = payload.params.unwrap_or_default();
+    let mut resolved_params: HashMap<String, String> = HashMap::new();
+    for param_def in &definition.params {
+        if let Some(value) = run_params.get(&param_def.name) {
+            resolved_params.insert(param_def.name.clone(), value.clone());
+        } else if let Some(default) = &param_def.default {
+            resolved_params.insert(param_def.name.clone(), default.clone());
+        } else if param_def.required {
+            return Err(ApiError::bad_request(format!("required parameter '{}' is missing", param_def.name)));
+        }
+    }
+    // Reject unknown parameters
+    for key in run_params.keys() {
+        if !definition.params.iter().any(|p| p.name == *key) {
+            return Err(ApiError::bad_request(format!("unknown parameter '{}'", key)));
+        }
+    }
+    let params_json = if resolved_params.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&resolved_params).unwrap_or_default())
+    };
+
     let mut tx = state.pool.begin().await?;
 
     let result = sqlx::query(
         r#"
         INSERT INTO job_runs (
             job_definition_id, job_id, job_name, status, trigger_type, triggered_by,
-            definition_path, definition_hash, working_dir, queued_at
+            definition_path, definition_hash, working_dir, queued_at, params_json
         )
-        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
         "#,
     )
     .bind(job.id)
@@ -253,6 +302,7 @@ async fn start_run(
     .bind(&job.definition_path)
     .bind(&job.definition_hash)
     .bind(&working_dir)
+    .bind(&params_json)
     .execute(&mut *tx)
     .await?;
 
@@ -694,9 +744,809 @@ struct RunForRerun {
     working_dir: String,
 }
 
-struct ApiError {
-    status: StatusCode,
-    message: String,
+// ──────────────────────────────────────────────
+// Agent Management API
+// ──────────────────────────────────────────────
+
+#[derive(Debug, Serialize, FromRow)]
+struct AgentSummary {
+    agent_id: String,
+    name: String,
+    hostname: String,
+    labels_json: String,
+    status: String,
+    last_heartbeat_at: String,
+    registered_at: String,
+}
+
+async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentSummary>>, ApiError> {
+    let agents = sqlx::query_as::<_, AgentSummary>(
+        "SELECT agent_id, name, hostname, labels_json, status, last_heartbeat_at, registered_at FROM agents ORDER BY registered_at",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(agents))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterAgentRequest {
+    name: String,
+    hostname: String,
+    labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterAgentResponse {
+    agent_id: String,
+    token: String,
+}
+
+async fn register_agent(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterAgentRequest>,
+) -> Result<(StatusCode, Json<RegisterAgentResponse>), ApiError> {
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+
+    let agent_id = format!("agent-{}", generate_random_id());
+    let token = generate_token();
+    let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let labels = payload.labels.unwrap_or_default();
+    let labels_json = serde_json::to_string(&labels)
+        .map_err(|e| ApiError::bad_request(format!("invalid labels: {e}")))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO agents (agent_id, name, hostname, labels_json, token_hash)
+        VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(name)
+    .bind(&payload.hostname)
+    .bind(&labels_json)
+    .bind(&token_hash)
+    .execute(&state.pool)
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RegisterAgentResponse { agent_id, token }),
+    ))
+}
+
+async fn get_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentSummary>, ApiError> {
+    let agent = sqlx::query_as::<_, AgentSummary>(
+        "SELECT agent_id, name, hostname, labels_json, status, last_heartbeat_at, registered_at FROM agents WHERE agent_id = ?",
+    )
+    .bind(&agent_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match agent {
+        Some(a) => Ok(Json(a)),
+        None => Err(ApiError::not_found("agent not found")),
+    }
+}
+
+async fn delete_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let result = sqlx::query("DELETE FROM agents WHERE agent_id = ?")
+        .bind(&agent_id)
+        .execute(&state.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("agent not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ──────────────────────────────────────────────
+// Agent Worker API
+// ──────────────────────────────────────────────
+
+async fn authenticate_agent(pool: &SqlitePool, headers: &HeaderMap) -> Result<String, ApiError> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("missing or invalid Authorization header"))?;
+
+    let token_hash = format!("{:x}", Sha256::digest(auth.as_bytes()));
+    let agent_id = sqlx::query_scalar::<_, String>(
+        "SELECT agent_id FROM agents WHERE token_hash = ? AND status = 'online'"
+    )
+    .bind(&token_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: e.to_string() })?;
+
+    agent_id.ok_or_else(|| ApiError::unauthorized("invalid token or agent offline"))
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct TaskRow {
+    node_run_id: i64,
+    job_run_id: i64,
+    node_id: String,
+    node_name: Option<String>,
+    program: String,
+    args_json: String,
+    working_dir: String,
+    env_json: Option<String>,
+    timeout_sec: i64,
+    definition_path: String,
+    job_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskResponse {
+    node_run_id: i64,
+    job_run_id: i64,
+    node_id: String,
+    node_name: Option<String>,
+    program: String,
+    args_json: String,
+    working_dir: String,
+    env_json: Option<String>,
+    timeout_sec: i64,
+    outputs: Vec<TaskOutputDef>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskOutputDef {
+    path: String,
+    required: bool,
+}
+
+async fn poll_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    // Get agent labels
+    let labels_json = sqlx::query_scalar::<_, String>(
+        "SELECT labels_json FROM agents WHERE agent_id = ?"
+    )
+    .bind(&agent_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let _agent_labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
+
+    // Find queued node_runs assigned to this agent
+    let task = sqlx::query_as::<_, TaskRow>(
+        r#"
+        SELECT nr.id AS node_run_id, nr.job_run_id, nr.node_id, nr.node_name,
+               nr.program, nr.args_json, nr.working_dir, nr.env_json, nr.timeout_sec,
+               jr.definition_path, jr.job_id
+        FROM node_runs nr
+        JOIN job_runs jr ON nr.job_run_id = jr.id
+        WHERE nr.status = 'queued'
+          AND nr.assigned_agent_id = ?
+        ORDER BY nr.created_at ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(&agent_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match task {
+        Some(task) => {
+            // Load outputs from job definition for this node
+            let outputs = match JobDefinition::load(&task.definition_path) {
+                Ok(def) => def
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == task.node_id)
+                    .map(|n| {
+                        n.outputs
+                            .iter()
+                            .map(|o| TaskOutputDef {
+                                path: o.path.clone(),
+                                required: o.required,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+
+            // Mark as running
+            sqlx::query("UPDATE node_runs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?")
+                .bind(task.node_run_id)
+                .execute(&state.pool)
+                .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at)
+                VALUES (?, ?, 'node', 'status_changed', 'queued', 'running', 'picked by agent', CURRENT_TIMESTAMP)
+                "#,
+            )
+            .bind(task.job_run_id)
+            .bind(task.node_run_id)
+            .execute(&state.pool)
+            .await?;
+
+            let response = TaskResponse {
+                node_run_id: task.node_run_id,
+                job_run_id: task.job_run_id,
+                node_id: task.node_id,
+                node_name: task.node_name,
+                program: task.program,
+                args_json: task.args_json,
+                working_dir: task.working_dir,
+                env_json: task.env_json,
+                timeout_sec: task.timeout_sec,
+                outputs,
+            };
+
+            Ok(Json(response).into_response())
+        }
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportResultRequest {
+    node_run_id: i64,
+    status: String,
+    exit_code: Option<i32>,
+    failure_reason: Option<String>,
+    artifacts: Option<Vec<ArtifactReport>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactReport {
+    path: String,
+    resolved_path: String,
+    required: bool,
+    exists: bool,
+    size_bytes: Option<i64>,
+}
+
+async fn report_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ReportResultRequest>,
+) -> Result<StatusCode, ApiError> {
+    let agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    // Verify the node is assigned to this agent and is running
+    let assigned = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT assigned_agent_id FROM node_runs WHERE id = ?"
+    )
+    .bind(payload.node_run_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .flatten();
+
+    if assigned.as_deref() != Some(&agent_id) {
+        return Err(ApiError::bad_request("node not assigned to this agent"));
+    }
+
+    let valid_statuses = ["success", "failed", "timed_out", "canceled"];
+    if !valid_statuses.contains(&payload.status.as_str()) {
+        return Err(ApiError::bad_request("invalid status"));
+    }
+
+    let finished = matches!(payload.status.as_str(), "success" | "failed" | "timed_out" | "canceled");
+
+    // Get job_run_id for events
+    let job_run_id = sqlx::query_scalar::<_, i64>(
+        "SELECT job_run_id FROM node_runs WHERE id = ?"
+    )
+    .bind(payload.node_run_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE node_runs
+        SET status = ?,
+            exit_code = ?,
+            failure_reason = ?,
+            finished_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE finished_at END
+        WHERE id = ?
+        "#,
+    )
+    .bind(&payload.status)
+    .bind(payload.exit_code)
+    .bind(payload.failure_reason.as_deref())
+    .bind(finished)
+    .bind(payload.node_run_id)
+    .execute(&state.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at)
+        VALUES (?, ?, 'node', 'status_changed', 'running', ?, ?, CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(job_run_id)
+    .bind(payload.node_run_id)
+    .bind(&payload.status)
+    .bind(payload.failure_reason.as_deref())
+    .execute(&state.pool)
+    .await?;
+
+    // Record artifacts if provided
+    if let Some(artifacts) = &payload.artifacts {
+        for artifact in artifacts {
+            sqlx::query(
+                r#"
+                INSERT INTO run_artifacts (
+                    job_run_id, node_run_id, path, resolved_path, required, exists_flag, size_bytes, checked_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                "#,
+            )
+            .bind(job_run_id)
+            .bind(payload.node_run_id)
+            .bind(&artifact.path)
+            .bind(&artifact.resolved_path)
+            .bind(if artifact.required { 1 } else { 0 })
+            .bind(if artifact.exists { 1 } else { 0 })
+            .bind(artifact.size_bytes)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportLogsRequest {
+    node_run_id: i64,
+    logs: Vec<LogEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogEntry {
+    stream: String,
+    content: String,
+}
+
+async fn report_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ReportLogsRequest>,
+) -> Result<StatusCode, ApiError> {
+    let _agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    let job_run_id = sqlx::query_scalar::<_, i64>(
+        "SELECT job_run_id FROM node_runs WHERE id = ?"
+    )
+    .bind(payload.node_run_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("node run not found"))?;
+
+    let mut next_sequence = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(sequence), 0) FROM run_logs WHERE job_run_id = ?"
+    )
+    .bind(job_run_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    for entry in &payload.logs {
+        next_sequence += 1;
+        sqlx::query(
+            r#"
+            INSERT INTO run_logs (job_run_id, node_run_id, stream, sequence, content, occurred_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .bind(job_run_id)
+        .bind(payload.node_run_id)
+        .bind(&entry.stream)
+        .bind(next_sequence)
+        .bind(&entry.content)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    sqlx::query("UPDATE agents SET last_heartbeat_at = CURRENT_TIMESTAMP, status = 'online' WHERE agent_id = ?")
+        .bind(&agent_id)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn upload_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<StatusCode, ApiError> {
+    let _agent_id = authenticate_agent(&state.pool, &headers).await?;
+
+    let mut node_run_id: Option<i64> = None;
+    let mut artifact_path: Option<String> = None;
+    let mut file_data: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("multipart error: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "node_run_id" => {
+                let text = field.text().await.map_err(|e| ApiError::bad_request(e.to_string()))?;
+                node_run_id = Some(text.parse::<i64>().map_err(|e| ApiError::bad_request(e.to_string()))?);
+            }
+            "path" => {
+                artifact_path = Some(field.text().await.map_err(|e| ApiError::bad_request(e.to_string()))?);
+            }
+            "file" => {
+                file_data = Some(field.bytes().await.map_err(|e| ApiError::bad_request(e.to_string()))?.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    let node_run_id = node_run_id.ok_or_else(|| ApiError::bad_request("node_run_id is required"))?;
+    let artifact_path = artifact_path.ok_or_else(|| ApiError::bad_request("path is required"))?;
+    let file_data = file_data.ok_or_else(|| ApiError::bad_request("file is required"))?;
+
+    let job_run_id = sqlx::query_scalar::<_, i64>(
+        "SELECT job_run_id FROM node_runs WHERE id = ?"
+    )
+    .bind(node_run_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("node run not found"))?;
+
+    // Store artifact: artifacts/{job_run_id}/{node_run_id}/{path}
+    let dest_dir = state.artifacts_dir
+        .join(job_run_id.to_string())
+        .join(node_run_id.to_string());
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to create artifact dir: {e}") })?;
+
+    let dest_path = dest_dir.join(&artifact_path);
+    // Ensure parent directory exists for nested paths
+    if let Some(parent) = dest_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to create dir: {e}") })?;
+    }
+
+    let size_bytes = file_data.len() as i64;
+    tokio::fs::write(&dest_path, &file_data)
+        .await
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to write artifact: {e}") })?;
+
+    // Record in DB
+    sqlx::query(
+        r#"
+        INSERT INTO run_artifacts (
+            job_run_id, node_run_id, path, resolved_path, required, exists_flag, size_bytes, checked_at
+        )
+        VALUES (?, ?, ?, ?, 1, 1, ?, CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(job_run_id)
+    .bind(node_run_id)
+    .bind(&artifact_path)
+    .bind(dest_path.to_string_lossy().to_string())
+    .bind(size_bytes)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(StatusCode::OK)
+}
+
+// ──────────────────────────────────────────────
+// Secrets API
+// ──────────────────────────────────────────────
+
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+
+fn encrypt_secret(key: &[u8], plaintext: &str) -> Result<(String, String), ApiError> {
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("invalid secret key: {e}") })?;
+    let mut nonce_bytes = [0u8; 12];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("encryption failed: {e}") })?;
+    Ok((hex::encode(ciphertext), hex::encode(nonce_bytes)))
+}
+
+fn decrypt_secret(key: &[u8], encrypted_hex: &str, nonce_hex: &str) -> Result<String, ApiError> {
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("invalid secret key: {e}") })?;
+    let ciphertext = hex::decode(encrypted_hex)
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("invalid encrypted data: {e}") })?;
+    let nonce_bytes = hex::decode(nonce_hex)
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("invalid nonce: {e}") })?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plaintext = cipher.decrypt(nonce, ciphertext.as_slice())
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("decryption failed: {e}") })?;
+    String::from_utf8(plaintext)
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("invalid utf8: {e}") })
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSecretRequest {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SecretResponse {
+    name: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct SecretSummary {
+    name: String,
+    created_at: String,
+    updated_at: String,
+}
+
+async fn list_secrets(State(state): State<AppState>) -> Result<Json<Vec<SecretSummary>>, ApiError> {
+    let secrets = sqlx::query_as::<_, SecretSummary>(
+        "SELECT name, created_at, updated_at FROM secrets ORDER BY name"
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(secrets))
+}
+
+async fn create_secret(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateSecretRequest>,
+) -> Result<(StatusCode, Json<SecretResponse>), ApiError> {
+    let key = state.secret_key.as_deref()
+        .ok_or_else(|| ApiError::bad_request("POSTJEN_SECRET_KEY is not configured"))?;
+
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+
+    let (encrypted, nonce) = encrypt_secret(key, &payload.value)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO secrets (name, encrypted_value, nonce)
+        VALUES (?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            encrypted_value = excluded.encrypted_value,
+            nonce = excluded.nonce,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(name)
+    .bind(&encrypted)
+    .bind(&nonce)
+    .execute(&state.pool)
+    .await?;
+
+    let row = sqlx::query_as::<_, SecretSummary>(
+        "SELECT name, created_at, updated_at FROM secrets WHERE name = ?"
+    )
+    .bind(name)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(SecretResponse {
+        name: row.name,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })))
+}
+
+async fn get_secret(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<SecretSummary>, ApiError> {
+    let secret = sqlx::query_as::<_, SecretSummary>(
+        "SELECT name, created_at, updated_at FROM secrets WHERE name = ?"
+    )
+    .bind(&name)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match secret {
+        Some(s) => Ok(Json(s)),
+        None => Err(ApiError::not_found("secret not found")),
+    }
+}
+
+async fn delete_secret(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let result = sqlx::query("DELETE FROM secrets WHERE name = ?")
+        .bind(&name)
+        .execute(&state.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("secret not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Resolve secrets from DB and return as name→value map
+pub async fn resolve_secrets(pool: &SqlitePool, secret_key: &[u8], secret_names: &[String]) -> Result<HashMap<String, String>, ApiError> {
+    let mut resolved = HashMap::new();
+    for name in secret_names {
+        let row = sqlx::query_as::<_, SecretRow>(
+            "SELECT encrypted_value, nonce FROM secrets WHERE name = ?"
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: e.to_string() })?;
+
+        match row {
+            Some(row) => {
+                let value = decrypt_secret(secret_key, &row.encrypted_value, &row.nonce)?;
+                resolved.insert(name.clone(), value);
+            }
+            None => {
+                return Err(ApiError::bad_request(format!("secret '{}' not found", name)));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+#[derive(Debug, FromRow)]
+struct SecretRow {
+    encrypted_value: String,
+    nonce: String,
+}
+
+// ──────────────────────────────────────────────
+// Webhook trigger
+// ──────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct WebhookPayload {
+    params: Option<HashMap<String, String>>,
+    triggered_by: Option<String>,
+}
+
+async fn webhook_trigger(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    payload: Option<Json<WebhookPayload>>,
+) -> Result<(StatusCode, Json<StartRunResponse>), ApiError> {
+    let job = sqlx::query_as::<_, JobDefinitionForRun>(
+        "SELECT id, job_id, name, definition_path, definition_hash, enabled FROM job_definitions WHERE job_id = ?"
+    )
+    .bind(&job_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let job = match job {
+        Some(job) => job,
+        None => return Err(ApiError::not_found("job not found")),
+    };
+
+    if job.enabled == 0 {
+        return Err(ApiError::conflict("job is disabled"));
+    }
+
+    let definition = JobDefinition::load(&job.definition_path)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+
+    // Check webhook is enabled in triggers
+    let webhook_enabled = definition.triggers.as_ref().map_or(false, |t| t.webhook);
+    if !webhook_enabled {
+        return Err(ApiError::bad_request("webhook trigger is not enabled for this job"));
+    }
+
+    let working_dir = definition.working_dir;
+    let payload = payload.map(|p| p.0);
+    let run_params = payload.as_ref().and_then(|p| p.params.clone()).unwrap_or_default();
+    let triggered_by = payload.as_ref().and_then(|p| p.triggered_by.clone());
+
+    // Validate params
+    let mut resolved_params: HashMap<String, String> = HashMap::new();
+    for param_def in &definition.params {
+        if let Some(value) = run_params.get(&param_def.name) {
+            resolved_params.insert(param_def.name.clone(), value.clone());
+        } else if let Some(default) = &param_def.default {
+            resolved_params.insert(param_def.name.clone(), default.clone());
+        } else if param_def.required {
+            return Err(ApiError::bad_request(format!("required parameter '{}' is missing", param_def.name)));
+        }
+    }
+    let params_json = if resolved_params.is_empty() { None } else { Some(serde_json::to_string(&resolved_params).unwrap_or_default()) };
+
+    let mut tx = state.pool.begin().await?;
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO job_runs (
+            job_definition_id, job_id, job_name, status, trigger_type, triggered_by,
+            definition_path, definition_hash, working_dir, queued_at, params_json
+        )
+        VALUES (?, ?, ?, 'queued', 'webhook', ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+        "#,
+    )
+    .bind(job.id)
+    .bind(&job.job_id)
+    .bind(&job.name)
+    .bind(triggered_by.as_deref())
+    .bind(&job.definition_path)
+    .bind(&job.definition_hash)
+    .bind(&working_dir)
+    .bind(&params_json)
+    .execute(&mut *tx)
+    .await?;
+
+    let run_id = result.last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO run_events (job_run_id, node_run_id, scope, event_type, from_status, to_status, message, occurred_at) VALUES (?, NULL, 'job', 'status_changed', NULL, 'queued', 'webhook triggered', CURRENT_TIMESTAMP)"
+    )
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let response = sqlx::query_as::<_, StartRunResponse>(
+        "SELECT id AS run_id, status, queued_at FROM job_runs WHERE id = ?"
+    )
+    .bind(run_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+fn generate_random_id() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 8] = rng.r#gen();
+    hex::encode(bytes)
+}
+
+fn generate_token() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.r#gen();
+    hex::encode(bytes)
+}
+
+// ──────────────────────────────────────────────
+// Error handling
+// ──────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: StatusCode,
+    pub message: String,
 }
 
 impl ApiError {
@@ -721,6 +1571,12 @@ impl ApiError {
         }
     }
 
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<sqlx::Error> for ApiError {

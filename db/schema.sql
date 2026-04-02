@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS job_definitions (
     definition_path TEXT NOT NULL,
     definition_hash TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    triggers_json TEXT,
+    last_triggered_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (job_id)
@@ -41,10 +43,26 @@ CREATE TABLE IF NOT EXISTS job_runs (
     cancel_requested_at TEXT,
     rerun_of_job_run_id INTEGER,
     failure_reason TEXT,
+    params_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (job_definition_id) REFERENCES job_definitions(id),
     FOREIGN KEY (rerun_of_job_run_id) REFERENCES job_runs(id)
 );
+
+CREATE TABLE IF NOT EXISTS agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    hostname TEXT NOT NULL,
+    labels_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'online' CHECK (status IN ('online', 'offline')),
+    token_hash TEXT NOT NULL,
+    last_heartbeat_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
 
 CREATE TABLE IF NOT EXISTS node_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,6 +93,8 @@ CREATE TABLE IF NOT EXISTS node_runs (
     finished_at TEXT,
     cancel_requested_at TEXT,
     failure_reason TEXT,
+    target_json TEXT,
+    assigned_agent_id TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (job_run_id) REFERENCES job_runs(id),
     UNIQUE (job_run_id, node_id)
@@ -118,6 +138,16 @@ CREATE TABLE IF NOT EXISTS run_artifacts (
     checked_at TEXT NOT NULL,
     FOREIGN KEY (job_run_id) REFERENCES job_runs(id),
     FOREIGN KEY (node_run_id) REFERENCES node_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    encrypted_value TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_job_runs_job_definition_id_created_at

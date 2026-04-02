@@ -169,13 +169,276 @@
   - フレームワークは未確定、選定時の考慮点のみ記載
   - 3 フェーズの段階的導入計画
 
+### 9. プロジェクト名リネーム（postgen → postjen）
+
+Jenkins 後継の意図に合わせて、プロジェクト全体の名称を `postgen` から `postjen` に統一した。
+
+変更内容:
+
+- ディレクトリ名: `crates/postgen-server` → `crates/postjen-server`
+- パッケージ名: `postgen-server` → `postjen-server`
+- 環境変数: `POSTGEN_BIND_ADDR` → `POSTJEN_BIND_ADDR`, `POSTGEN_DATABASE_URL` → `POSTJEN_DATABASE_URL`
+- DB ファイル名: `postgen.db` → `postjen.db`
+- 全ドキュメント・サンプル YAML 内の表記を修正
+- `db.rs` に `create_if_missing(true)` を追加（DB 未作成時の起動エラー修正）
+
+関連ブランチとコミット:
+
+- `feature/proj_rename`
+
+### 10. リモートエージェント機能の実装
+
+[remote-agent-design.md](/docs/remote-agent-design.md) に基づき、Agent Pull 型のリモート実行機能を実装した。
+
+#### クレート構成の変更
+
+- `crates/postjen-core` を新設（共有ライブラリ）
+  - `definition.rs` — ジョブ定義パース・バリデーション・トポロジカルソート（サーバから移動）
+  - `executor.rs` — ノード実行ロジック（`run_process`, `check_outputs`）を DB 非依存で切り出し
+  - `types.rs` — `NodeExecutionOutcome`, `ArtifactResult` 等の共通型
+- `crates/postjen-agent` を新設（エージェントバイナリ）
+  - `client.rs` — サーバとの HTTP 通信（reqwest）
+  - `worker.rs` — ポーリング・実行・結果報告・ハートビートのループ処理
+  - CLI 引数: `--server-url`, `--name`, `--labels`, `--poll-interval`, `--heartbeat-interval`
+
+#### DB スキーマ拡張
+
+- `agents` テーブル追加（agent_id, name, hostname, labels_json, status, token_hash, last_heartbeat_at）
+- `node_runs` に `target_json`, `assigned_agent_id` カラム追加
+
+#### API 拡張
+
+エージェント管理 API（サーバ管理者向け）:
+
+- `GET /api/agents` — エージェント一覧
+- `POST /api/agents` — エージェント登録（トークン発行）
+- `GET /api/agents/:agent_id` — エージェント詳細
+- `DELETE /api/agents/:agent_id` — エージェント削除
+
+エージェント用 API（エージェントプロセスが使用、Bearer トークン認証）:
+
+- `GET /api/agent/task` — 割り当てられたタスクをポーリング（200 or 204）
+- `POST /api/agent/result` — ノード実行結果を報告
+- `POST /api/agent/logs` — 実行ログをバッチ送信
+- `POST /api/agent/heartbeat` — ハートビート送信
+
+#### ジョブ定義の拡張
+
+- `defaults.target` および `nodes[].target` に `labels` フィールドを追加
+- `target` 未指定ノードは従来通りサーバでローカル実行（後方互換）
+
+#### Runner スケジューリング拡張
+
+- `target` 付きノードはラベルが合致する online エージェントに割り当て
+- `wait_for_remote_node` でエージェントの結果報告をポーリング待機
+- リモートノード完了後、依存する後続ノードの実行を続行
+- ハートビート監視（15 秒間隔）でオフラインエージェントを検出し、該当ノードを `failed` に遷移
+
+#### E2E テスト結果
+
+`examples/jobs/sample-remote.yaml` を用いて、サーバ + エージェントの連携を localhost 上で検証した。
+
+- エージェント登録: 起動時に自動登録、`GET /api/agents` で status=online を確認
+- リモート実行: `remote-hello` ノードがエージェントで実行され、ログがサーバに記録された
+- 依存実行: `local-after-remote` ノードがリモートノード完了後にサーバでローカル実行された
+- ジョブ全体: status=success で完了
+- 状態遷移イベント: 全 9 イベントが正しい順序で記録された
+
+### 11. 成果物アップロード・エージェント名指定・target.agent 対応
+
+- リモートで生成された成果物をコントローラーにアップロードする機能を追加
+  - `POST /api/agent/artifacts`（マルチパート）でファイルを受信
+  - コントローラー側に `artifacts/{job_run_id}/{node_run_id}/{path}` として保存
+  - タスク情報に `outputs` 定義を含めてエージェントに送信
+  - エージェントが実行後に成果物の存在確認＋アップロードを実行
+  - `required: true` の成果物が欠落した場合はノードを `failed` にする
+- `target.agent` フィールドを追加し、エージェント名で明示的に実行先を指定可能にした
+  - OS やファイルシステムが異なるマシンへの振り分けを想定
+  - `target.labels` との AND 条件にも対応
+- `POSTJEN_ARTIFACTS_DIR` 環境変数を追加（デフォルト: `artifacts`）
+- `.gitignore` に `artifacts/` を追加
+
+### 12. 実行パスの統一（ビルトインローカルエージェント）
+
+runner.rs のローカル実行パスを廃止し、全ノードをエージェント経由で実行するよう統一した。
+
+変更内容:
+
+- サーバ起動時にビルトイン `local` エージェントを DB に自動登録
+- `target` 未指定ノードはビルトイン `local` エージェントに自動割り当て
+- ローカルワーカーがインプロセスで `local` エージェント宛タスクを DB から取得・実行
+- runner.rs の `execute_node()` 等の直接実行コードを削除
+- 実行パスが「スケジューラ → エージェント割当 → ワーカー実行」に一本化
+
+### 13. サーバ・エージェント統合（単一バイナリ化）
+
+`postjen-agent` クレートを廃止し、エージェント機能を `postjen-server` に統合した。
+
+変更内容:
+
+- `postjen-agent` の `client.rs`、`worker.rs` を `postjen-server` に `agent_client.rs`、`agent_worker.rs` として移動
+- `main.rs` に `clap` による CLI 引数パースを追加
+- `--connect-to` オプションで他サーバのリモートエージェントとして接続可能に
+- `--agent-name`、`--agent-labels`、`--poll-interval`、`--heartbeat-interval` オプション追加
+- `crates/postjen-agent` ディレクトリを削除、ワークスペースから除外
+
+動作モデル:
+
+- 単体起動: サーバ＋ビルトインローカルエージェント
+- `--connect-to` 付き起動: 上記に加えて指定コントローラーのリモートエージェントとしても動作
+- 全インスタンスがサーバでありエージェントでもある（Jenkins と同様の分散モデル）
+- 接続はリモート → コントローラーへの Pull 型。コントローラーのポートのみ開放すればよい
+
+E2E テスト結果:
+
+- コントローラー（:3000）とリモート（:3001）を同一マシンで起動
+- `target.agent: "linux-builder"` のノードがリモートで実行され `executed on remote server` を確認
+- `target` なしのノードがコントローラーで実行され `executed on controller` を確認
+- ジョブ全体: status=success
+
+### 14. usage.md 全面改訂
+
+統一アーキテクチャに合わせて usage.md を全面書き換えた。
+
+- 環境変数を `POSTJEN_*` に修正、`POSTJEN_ARTIFACTS_DIR` を追加
+- 起動セクション: 単体起動と `--connect-to` 付き起動を統一的に説明
+- 複数マシンでの分散実行の構成例を追加
+- リモート実行セクション: `postjen-agent` の記述を全削除、単一バイナリアーキテクチャに書き換え
+- 成果物セクション: ローカル/リモート両方の保存フローを統一的に記載
+- ファイルパス: WSL 固有の絶対パスを相対パスに修正
+
+### 15. ビルドパラメータ
+
+ジョブ定義に `params` フィールドを追加し、実行時にパラメータを渡せるようにした。
+
+変更内容:
+
+- `JobDefinition` / `ResolvedJobDefinition` に `params: Vec<ParamDefinition>` を追加
+- `ParamDefinition` は `name`, `default`, `required` を持つ
+- `StartRunRequest` に `params: Option<HashMap<String, String>>` を追加
+- start_run() で required チェック・unknown パラメータ拒否を実施
+- `job_runs` に `params_json` カラム追加
+- execute_run() でパラメータをノードの環境変数にマージ
+
+E2E テスト:
+
+- パラメータ指定実行: `GREETING=hey TARGET=world` → `hey world` 出力
+- デフォルト値適用: `TARGET=postjen` のみ → `hello postjen` 出力
+- required 欠落: 400 エラー `required parameter 'TARGET' is missing`
+- unknown パラメータ: 400 エラー `unknown parameter 'UNKNOWN'`
+
+### 16. ノード並列実行
+
+DAG 上で依存関係のないノードを同時に実行できるようにした。
+
+変更内容:
+
+- execute_run() のメインループを書き換え
+  - 従来: トポロジカル順に 1 ノードずつ割当→待機
+  - 変更後: 準備完了ノードをすべて同時に割当し、いずれかの完了を待つループ
+- `wait_for_any_node_completion()` を新規追加
+- ローカルワーカーを `pick_local_task()` + `execute_local_task()` に分割
+  - pick 時に即座に running にマークし、tokio::spawn で並列実行
+
+E2E テスト:
+
+- 独立ノード A, B（各 sleep 2秒）+ 依存ノード C の構成
+- A, B が同時に queued → running になることをイベントのタイムスタンプで確認
+- C は A, B 完了後に実行、ジョブ全体 success
+
+### 17. シークレット管理
+
+AES-256-GCM 暗号化によるシークレットの安全な保存と、実行時の環境変数注入を実装した。
+
+変更内容:
+
+- `secrets` テーブル追加（name, encrypted_value, nonce）
+- シークレット API 追加
+  - `POST /api/secrets` — 登録（暗号化保存）
+  - `GET /api/secrets` — 一覧（値は非表示）
+  - `GET /api/secrets/:name` — 詳細（値は非表示）
+  - `DELETE /api/secrets/:name` — 削除
+- `NodeDefinition` / `ResolvedNodeDefinition` に `secrets: Vec<String>` 追加
+- execute_run() でシークレットを DB から復号し、ノードの環境変数に注入
+- `POSTJEN_SECRET_KEY` 環境変数（32 バイト hex）で暗号化キーを設定
+
+E2E テスト:
+
+- `DB_PASSWORD=super_secret_123`, `API_KEY=key_abc_456` を登録
+- ジョブ定義で `secrets: ["DB_PASSWORD", "API_KEY"]` を参照
+- 実行ログに `DB=super_secret_123 API=key_abc_456` が出力されることを確認
+- 一覧 API ではシークレット値が非表示であることを確認
+
+### 18. トリガー機構（Webhook / Cron）
+
+外部システムからの Webhook とスケジュール実行（cron）によるジョブ自動トリガーを実装した。
+
+変更内容:
+
+- `JobDefinition` に `triggers: Option<Triggers>` 追加
+  - `Triggers { cron: Option<String>, webhook: bool }`
+- `POST /api/webhook/:job_id` エンドポイント追加
+  - webhook が有効なジョブのみ受付
+  - パラメータの受け渡しにも対応
+  - trigger_type = "webhook"
+- `scheduler.rs` を新規作成
+  - 30 秒間隔で全ジョブの cron 式を評価
+  - マッチした場合に run を自動作成（trigger_type = "cron"）
+  - `last_triggered_at` で重複実行を防止
+- `job_definitions` に `triggers_json`, `last_triggered_at` カラム追加
+- register_job() で triggers_json を保存
+
+E2E テスト:
+
+- Webhook: `POST /api/webhook/sample-webhook` でパラメータ付きトリガー → success
+- Webhook 未有効ジョブへの呼び出し → 400 エラー `webhook trigger is not enabled`
+
+## 現時点の状態
+
+できること:
+
+- ジョブ定義 YAML の登録
+- 単一ジョブの実行（ビルトインローカルエージェント経由）
+- DAG ベースのノード並列実行
+- 実行履歴、イベント、ログの取得
+- 再実行レコードの作成
+- キャンセル要求状態への更新
+- リモートエージェントへのノード実行委譲（Agent Pull 型）
+- `target.agent` によるエージェント名指定、`target.labels` によるラベルマッチ
+- エージェントの登録・管理・ハートビート監視・オフライン検出
+- 成果物のエージェント→コントローラーアップロード
+- 単一バイナリ（`postjen-server`）でサーバ＋エージェントの両役割
+- ビルドパラメータ（実行時にパラメータを渡して環境変数注入）
+- シークレット管理（AES-256-GCM 暗号化保存、実行時注入）
+- Webhook トリガー（外部からの HTTP 呼び出しでジョブ実行）
+- Cron トリガー（スケジュール式によるジョブ自動実行）
+
+未対応または今後の検討項目:
+
+- ジョブ間依存
+- 高度な再試行制御
+- Web UI の整備
+- 定義同期の自動化
+- 認証の強化（エージェント登録、API アクセス制御）
+- エージェントの自動再登録（再起動時は新規登録になる）
+- 負荷分散の改善（現在は最初にマッチしたエージェントに割当）
+- シークレットのログマスク（`run_logs` にシークレット値が平文で残る）
+- 条件付き実行（`when` による実行スキップ）
+
+## メモ
+
+- サンプル実行用の生成物は `examples/sample-work/` などローカル出力で扱う
+- 生成物の ignore 設定と機能追加は、今後はコミットを分ける方針
+- 既存サンプル（sample-hello 等）の `working_dir` は WSL 向けパスのため、macOS では実行不可
+- コントローラーがリモートマシンより先に起動している必要がある
+- シークレット利用には `POSTJEN_SECRET_KEY` 環境変数（32 バイト hex）の設定が必要
+
 ## Next Actions
 
 優先度順の次アクション:
 
-1. 追加したサンプルを実際に実行して、`success` / `failed` / `timed_out` の各ケースを確認する
-2. サンプル実行結果を `usage.md` か別ドキュメントへ追記し、期待される挙動を明文化する
-3. リモートエージェント Phase 1: `agents` テーブル追加、エージェント管理 API 実装、`node_runs` への `assigned_agent_id` 追加
-4. リモートエージェント Phase 2: `postjen-agent` バイナリの雛形作成、ポーリング・実行・結果報告の基本フロー実装
-5. Web UI Phase 1: フレームワーク選定、ダッシュボード（実行一覧）と実行詳細画面の実装
-6. `GET /api/runs` に `job_id` / `status` フィルタを追加（Web UI で必要）
+1. Web UI Phase 1: フレームワーク選定、ダッシュボード（実行一覧）と実行詳細画面の実装
+2. シークレットのログマスク: `run_logs` 挿入時にシークレット値を `***` に置換
+3. 認証の強化: エージェント登録・API アクセスの認可
+4. エージェント負荷分散の改善（ラウンドロビン等）
+5. 既存サンプルの `working_dir` を環境非依存なパスに修正
