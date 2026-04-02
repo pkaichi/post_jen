@@ -146,11 +146,18 @@ UI での活用方針:
 
 ## 画面遷移
 
-```text
-ダッシュボード
-  ├─→ ジョブ一覧 ──→ ジョブ詳細 ──→ 実行詳細 ──→ ログ表示
-  ├─→ 実行詳細（直近 run クリック）
-  └─→ エージェント一覧（リモート対応後）
+```mermaid
+graph LR
+    Dashboard[ダッシュボード]
+    JobList[ジョブ一覧]
+    JobDetail[ジョブ詳細]
+    RunDetail[実行詳細]
+    Logs[ログ表示]
+    Agents[エージェント一覧]
+
+    Dashboard --> JobList --> JobDetail --> RunDetail --> Logs
+    Dashboard -- "直近 run クリック" --> RunDetail
+    Dashboard --> Agents
 ```
 
 ## 技術選定の方針
