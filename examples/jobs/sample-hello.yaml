@@ -3,11 +3,11 @@ id: sample-hello
 name: Sample Hello Job
 description: Create a sample artifact and emit a simple log
 defaults:
-  working_dir: /mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples/sample-work
+  working_dir: /mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples/sample-work
   timeout_sec: 30
   retry: 0
   env:
-    SAMPLE_MESSAGE: hello from postgen
+    SAMPLE_MESSAGE: hello from postjen
 nodes:
   - id: write_file
     name: Write sample artifact

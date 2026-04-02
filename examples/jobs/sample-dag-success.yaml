@@ -3,7 +3,7 @@ id: sample-dag-success
 name: Sample DAG Success Job
 description: Run two dependent nodes and produce a final artifact
 defaults:
-  working_dir: /mnt/c/Users/pkaichi/workspace/postjen/postgen_proj/examples
+  working_dir: /mnt/c/Users/pkaichi/workspace/postjen/postjen_proj/examples
   timeout_sec: 30
   retry: 0
 nodes:

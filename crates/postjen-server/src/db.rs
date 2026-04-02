@@ -1,12 +1,14 @@
 use anyhow::Result;
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions}};
+use std::str::FromStr;
 
 const SCHEMA_SQL: &str = include_str!("../../../db/schema.sql");
 
 pub async fn connect(database_url: &str) -> Result<SqlitePool> {
+    let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(database_url)
+        .connect_with(options)
         .await?;
 
     sqlx::query("PRAGMA foreign_keys = ON;")
