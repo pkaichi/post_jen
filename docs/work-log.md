@@ -443,6 +443,45 @@ cd ../.. && cargo build -p postjen-server
 - `/api/*` は既存の REST API がそのまま動作すること
 - ジョブの登録・実行・ログ確認が UI から操作可能なこと
 
+### 20. Web UI Phase 2 実装（パラメータ入力ダイアログ・DAG 可視化）
+
+Phase 1 で作成した Web UI に、パラメータ入力ダイアログと DAG グラフ表示を追加した。
+
+#### パラメータ入力ダイアログ
+
+- Run ボタン押下時にジョブ定義を取得し、`params` があればモーダルダイアログを表示
+- パラメータなしのジョブは従来通り即実行
+- 各パラメータに `required` 表示とデフォルト値の事前入力
+- バリデーションエラーをダイアログ内に表示
+- ダッシュボード・ジョブ詳細の両画面で対応
+
+#### DAG 可視化
+
+- ジョブ定義の `nodes` と `depends_on` からトポロジカルレベルを計算し、SVG で描画
+- ノード間のエッジはベジェ曲線＋矢印で表示
+- **ジョブ詳細ページ**: 定義のノード構造を静的グラフで表示
+- **実行詳細ページ**: 各ノードの実行状態（success/failed/running 等）で色分け表示（3 秒ポーリングで更新）
+
+#### その他の追加
+
+- ジョブ詳細ページに定義メタ情報（Description、Params、Triggers、ノード数）を表示
+- 実行詳細のジョブ名からジョブ詳細ページへのリンクを追加
+- `api.rs` に `JobDefinition`, `ParamDefinition`, `NodeDefinition` 型と `fetch_job_definition` を追加
+- `start_run` API 関数をパラメータ対応に変更（エラーレスポンスのハンドリングも追加）
+
+#### 変更ファイル
+
+- `crates/postjen-ui/src/api.rs` — 型定義追加、API 関数追加・変更
+- `crates/postjen-ui/src/components.rs` — `ParamDialog`, `DagGraph` コンポーネント追加
+- `crates/postjen-ui/src/pages/dashboard.rs` — Run ボタンのパラメータダイアログ対応
+- `crates/postjen-ui/src/pages/job_detail.rs` — DAG 表示、定義情報表示、パラメータダイアログ対応
+- `crates/postjen-ui/src/pages/run_detail.rs` — DAG 表示（ノード実行状態付き）
+- `crates/postjen-ui/style/main.css` — モーダル、DAG グラフ、定義情報のスタイル追加
+
+関連ブランチ:
+
+- `feature/web_ui`
+
 ## 現時点の状態
 
 できること:
@@ -463,12 +502,12 @@ cd ../.. && cargo build -p postjen-server
 - Webhook トリガー（外部からの HTTP 呼び出しでジョブ実行）
 - Cron トリガー（スケジュール式によるジョブ自動実行）
 - Web UI（Leptos WASM SPA、サーバ埋め込み配信）
+- Web UI Phase 2（パラメータ入力ダイアログ、DAG 可視化）
 
 未対応または今後の検討項目:
 
 - ジョブ間依存
 - 高度な再試行制御
-- Web UI Phase 2: パラメータ入力ダイアログ、DAG 可視化
 - Web UI Phase 3: シークレット登録/削除、ジョブ有効/無効切替
 - 定義同期の自動化
 - 認証の強化（エージェント登録、API アクセス制御）
@@ -490,8 +529,8 @@ cd ../.. && cargo build -p postjen-server
 
 優先度順の次アクション:
 
-1. Web UI Phase 2: パラメータ入力ダイアログ、DAG 可視化
-2. Web UI Phase 3: シークレット登録/削除操作、ジョブ有効/無効切替
-3. シークレットのログマスク: `run_logs` 挿入時にシークレット値を `***` に置換
-4. 認証の強化: エージェント登録・API アクセスの認可
-5. エージェント負荷分散の改善（ラウンドロビン等）
+1. Web UI Phase 3: シークレット登録/削除操作、ジョブ有効/無効切替
+2. シークレットのログマスク: `run_logs` 挿入時にシークレット値を `***` に置換
+3. 認証の強化: エージェント登録・API アクセスの認可
+4. エージェント負荷分散の改善（ラウンドロビン等）
+5. 条件付き実行（`when` による実行スキップ）
