@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use leptos::*;
 use leptos_router::*;
 use crate::api;
@@ -15,6 +16,17 @@ pub fn RunDetailPage() -> impl IntoView {
     let logs = create_resource(move || run_id(), |rid| async move {
         api::fetch_run_logs(rid, None).await
     });
+
+    // ジョブ定義（DAG表示用）- run取得後にjob_idで取得
+    let definition = create_resource(
+        move || run.get().and_then(|r| r.ok()).map(|r| r.job_id.clone()),
+        |maybe_jid| async move {
+            match maybe_jid {
+                Some(jid) => api::fetch_job_definition(&jid).await.ok(),
+                None => None,
+            }
+        },
+    );
 
     // Polling for live updates
     let (tick, set_tick) = create_signal(0u32);
@@ -69,10 +81,13 @@ pub fn RunDetailPage() -> impl IntoView {
                             let finished = r.finished_at.clone().unwrap_or_else(|| "—".to_string());
                             let failure = r.failure_reason.clone();
                             let job_name = r.job_name.clone();
+                            let job_id = r.job_id.clone();
                             let id = r.id;
                             view! {
                                 <div class="header-row">
-                                    <h2>"Run #" {id} " — " {job_name}</h2>
+                                    <h2>"Run #" {id} " — "
+                                        <A href=format!("/jobs/{}", job_id) class="back-link">{job_name}</A>
+                                    </h2>
                                     <StatusBadge status=status />
                                 </div>
                                 <div class="meta-grid">
@@ -95,6 +110,30 @@ pub fn RunDetailPage() -> impl IntoView {
                     })
                 }}
             </Suspense>
+        </div>
+
+        // DAGグラフ（ノード実行状態付き）
+        <div class="card">
+            <h2>"Node Graph"</h2>
+            {move || {
+                let def = definition.get().flatten();
+                let node_runs = nodes_live.get().or_else(|| nodes.get())
+                    .and_then(|r| r.ok());
+                match (def, node_runs) {
+                    (Some(def), Some(nrs)) => {
+                        let statuses: HashMap<String, String> = nrs.iter()
+                            .map(|nr| (nr.node_id.clone(), nr.status.clone()))
+                            .collect();
+                        view! {
+                            <DagGraph nodes=def.nodes.clone() node_statuses=statuses />
+                        }.into_view()
+                    }
+                    (Some(def), None) => {
+                        view! { <DagGraph nodes=def.nodes.clone() /> }.into_view()
+                    }
+                    _ => view! { <Loading /> }.into_view(),
+                }
+            }}
         </div>
 
         <div class="card">

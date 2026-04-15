@@ -1,5 +1,48 @@
+use std::collections::HashMap;
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ParamDefinition {
+    pub name: String,
+    pub default: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NodeTarget {
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NodeDefinition {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    pub target: Option<NodeTarget>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Triggers {
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub webhook: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JobDefinition {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub params: Vec<ParamDefinition>,
+    pub triggers: Option<Triggers>,
+    pub nodes: Vec<NodeDefinition>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RunSummary {
@@ -130,12 +173,27 @@ pub async fn fetch_secrets() -> Result<Vec<SecretSummary>, String> {
     resp.json().await.map_err(|e| e.to_string())
 }
 
-pub async fn start_run(job_id: &str) -> Result<StartRunResponse, String> {
+pub async fn fetch_job_definition(job_id: &str) -> Result<JobDefinition, String> {
+    let resp = Request::get(&format!("/api/jobs/{job_id}/definition"))
+        .send().await.map_err(|e| e.to_string())?;
+    resp.json().await.map_err(|e| e.to_string())
+}
+
+pub async fn start_run(job_id: &str, params: Option<HashMap<String, String>>) -> Result<StartRunResponse, String> {
+    let body = serde_json::json!({
+        "trigger_type": "manual",
+        "triggered_by": "web-ui",
+        "params": params,
+    });
     let resp = Request::post(&format!("/api/jobs/{job_id}/runs"))
         .header("Content-Type", "application/json")
-        .body(r#"{"trigger_type":"manual","triggered_by":"web-ui"}"#)
+        .body(serde_json::to_string(&body).unwrap())
         .map_err(|e| e.to_string())?
         .send().await.map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(text);
+    }
     resp.json().await.map_err(|e| e.to_string())
 }
 

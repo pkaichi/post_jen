@@ -15,7 +15,40 @@ pub fn DashboardPage() -> impl IntoView {
     let runs_polling = create_resource(move || tick.get(), |_| api::fetch_runs(20));
     let jobs_polling = create_resource(move || tick.get(), |_| api::fetch_jobs());
 
+    // パラメータダイアログの状態
+    let (dialog_job_id, set_dialog_job_id) = create_signal(Option::<String>::None);
+    let (dialog_params, set_dialog_params) = create_signal(Vec::<api::ParamDefinition>::new());
+
+    let handle_run_click = move |job_id: String| {
+        spawn_local(async move {
+            match api::fetch_job_definition(&job_id).await {
+                Ok(def) if !def.params.is_empty() => {
+                    set_dialog_params.set(def.params);
+                    set_dialog_job_id.set(Some(job_id));
+                }
+                _ => {
+                    if let Ok(resp) = api::start_run(&job_id, None).await {
+                        let navigate = use_navigate();
+                        navigate(&format!("/runs/{}", resp.run_id), Default::default());
+                    }
+                }
+            }
+        });
+    };
+
     view! {
+        // パラメータダイアログ
+        {move || dialog_job_id.get().map(|jid| {
+            let params = dialog_params.get();
+            view! {
+                <ParamDialog
+                    job_id=jid
+                    params=params
+                    on_close=move |_| set_dialog_job_id.set(None)
+                />
+            }
+        })}
+
         <div class="card">
             <h2>"Recent Runs"</h2>
             <Suspense fallback=move || view! { <Loading /> }>
@@ -64,6 +97,7 @@ pub fn DashboardPage() -> impl IntoView {
             <Suspense fallback=move || view! { <Loading /> }>
                 {move || {
                     let data = jobs_polling.get().or_else(|| jobs.get());
+                    let handle_run = handle_run_click.clone();
                     data.map(|result| match result {
                         Ok(jobs) => view! {
                             <table>
@@ -79,6 +113,7 @@ pub fn DashboardPage() -> impl IntoView {
                                     {jobs.into_iter().map(|job| {
                                         let job_id_run = job.job_id.clone();
                                         let job_id_nav = job.job_id.clone();
+                                        let handle = handle_run.clone();
                                         view! {
                                             <tr class="clickable">
                                                 <td on:click=move |_| {
@@ -89,13 +124,7 @@ pub fn DashboardPage() -> impl IntoView {
                                                 <td>{if job.enabled == 1 { "✓" } else { "—" }}</td>
                                                 <td>
                                                     <button class="btn btn-primary" on:click=move |_| {
-                                                        let jid = job_id_run.clone();
-                                                        spawn_local(async move {
-                                                            if let Ok(resp) = api::start_run(&jid).await {
-                                                                let navigate = use_navigate();
-                                                                navigate(&format!("/runs/{}", resp.run_id), Default::default());
-                                                            }
-                                                        });
+                                                        handle(job_id_run.clone());
                                                     }>"▶ Run"</button>
                                                 </td>
                                             </tr>

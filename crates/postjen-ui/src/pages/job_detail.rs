@@ -14,22 +14,119 @@ pub fn JobDetailPage() -> impl IntoView {
         api::fetch_job_runs(&jid, 20).await
     });
 
+    let definition = create_resource(move || job_id(), |jid| async move {
+        api::fetch_job_definition(&jid).await
+    });
+
+    // パラメータダイアログの状態
+    let (show_dialog, set_show_dialog) = create_signal(false);
+
+    let handle_run_click = move |_| {
+        if let Some(Ok(def)) = definition.get() {
+            if !def.params.is_empty() {
+                set_show_dialog.set(true);
+                return;
+            }
+        }
+        let jid = job_id();
+        spawn_local(async move {
+            if let Ok(resp) = api::start_run(&jid, None).await {
+                let navigate = use_navigate();
+                navigate(&format!("/runs/{}", resp.run_id), Default::default());
+            }
+        });
+    };
+
     view! {
+        // パラメータダイアログ
+        {move || {
+            if show_dialog.get() {
+                definition.get().and_then(|r| r.ok()).map(|def| {
+                    let jid = job_id();
+                    let p = def.params.clone();
+                    view! {
+                        <ParamDialog
+                            job_id=jid
+                            params=p
+                            on_close=move |_| set_show_dialog.set(false)
+                        />
+                    }
+                })
+            } else {
+                None
+            }
+        }}
+
         <div class="header-row">
             <A href="/" class="back-link">"← Dashboard"</A>
-            <button class="btn btn-primary" on:click=move |_| {
-                let jid = job_id();
-                spawn_local(async move {
-                    if let Ok(resp) = api::start_run(&jid).await {
-                        let navigate = use_navigate();
-                        navigate(&format!("/runs/{}", resp.run_id), Default::default());
-                    }
-                });
-            }>"▶ Run"</button>
+            <button class="btn btn-primary" on:click=handle_run_click>"▶ Run"</button>
         </div>
 
         <div class="card">
             <h2>{move || format!("Job: {}", job_id())}</h2>
+            <Suspense fallback=move || view! { <Loading /> }>
+                {move || definition.get().map(|result| match result {
+                    Ok(def) => {
+                        let desc = def.description.clone().unwrap_or_else(|| "—".to_string());
+                        let triggers_display = match &def.triggers {
+                            Some(t) => {
+                                let mut parts = Vec::new();
+                                if let Some(cron) = &t.cron {
+                                    parts.push(format!("cron: {}", cron));
+                                }
+                                if t.webhook {
+                                    parts.push("webhook".to_string());
+                                }
+                                if parts.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    parts.join(", ")
+                                }
+                            }
+                            None => "—".to_string(),
+                        };
+                        let params_display = if def.params.is_empty() {
+                            "—".to_string()
+                        } else {
+                            def.params.iter().map(|p| {
+                                let mut s = p.name.clone();
+                                if p.required { s.push_str(" (required)"); }
+                                if let Some(d) = &p.default {
+                                    s.push_str(&format!(" = {d}"));
+                                }
+                                s
+                            }).collect::<Vec<_>>().join(", ")
+                        };
+                        let node_count = def.nodes.len();
+                        view! {
+                            <div class="def-info">
+                                <span class="meta-label">"Description"</span>
+                                <span>{desc}</span>
+                                <span class="meta-label">"Nodes"</span>
+                                <span>{node_count} " nodes"</span>
+                                <span class="meta-label">"Params"</span>
+                                <span>{params_display}</span>
+                                <span class="meta-label">"Triggers"</span>
+                                <span>{triggers_display}</span>
+                            </div>
+                        }.into_view()
+                    }
+                    Err(e) => view! { <p class="form-error">{e}</p> }.into_view(),
+                })}
+            </Suspense>
+        </div>
+
+        // DAGグラフ
+        <div class="card">
+            <h2>"Node Graph"</h2>
+            <Suspense fallback=move || view! { <Loading /> }>
+                {move || definition.get().map(|result| match result {
+                    Ok(def) => view! {
+                        <DagGraph nodes=def.nodes.clone() />
+                    }.into_view(),
+                    Err(_) => view! {}.into_view(),
+                })}
+            </Suspense>
         </div>
 
         <div class="card">
